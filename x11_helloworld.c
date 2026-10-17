@@ -17,6 +17,7 @@
 #define MAX_OUTPUT (4096 * 16)
 #define HISTORY_MAX 50
 
+
 typedef struct {
     char title[64];
     char cwd[1024];
@@ -145,36 +146,36 @@ void close_tab(int index) {
 /* Returns 1 if the buffer needs more input (unclosed quote or trailing \),
  * 0 if complete. */
 static int input_incomplete(const char *s, int len) {
-    int i = 0;
-    int in_sq = 0, in_dq = 0;
+    /* strip trailing newline for the trailing-backslash check */
+    int real = len;
+    if (real > 0 && s[real-1] == '\n') real--;
 
+    int i = 0, in_sq = 0, in_dq = 0;
     while (i < len) {
         char c = s[i];
 
         if (in_sq) {
             if (c == '\'') in_sq = 0;
-            i++;
-            continue;
+            i++; continue;
         }
-
         if (c == '\\') {
-            if (i + 1 >= len) return 1;   /* trailing backslash -> continue */
-            i += 2;
-            continue;
+            if (i + 1 >= len) return 1;
+            i += 2; continue;
         }
-
         if (in_dq) {
             if (c == '"') in_dq = 0;
-            i++;
-            continue;
+            i++; continue;
         }
-
         if (c == '\'') { in_sq = 1; i++; continue; }
         if (c == '"')  { in_dq = 1; i++; continue; }
-
         i++;
     }
-    return (in_sq || in_dq) ? 1 : 0;
+    if (in_sq || in_dq) return 1;
+
+    /* trailing backslash (before the added \n) means continue */
+    if (real > 0 && s[real-1] == '\\') return 1;
+
+    return 0;
 }
 
 /* Split a complete command line into argv with shell quoting rules.
@@ -259,6 +260,84 @@ static int shell_split(const char *line, char **args, int maxargs,
 }
 
 
+/* Extract unquoted < file and > file from a raw command line.
+ * Everything else (including quotes and $() content) is copied to `cleaned`.
+ * Returns 0 on success, -1 on missing filename. */
+static int parse_redirections(const char *line,
+                              char *cleaned, int cleaned_sz,
+                              char *in_file,  int in_sz,
+                              char *out_file, int out_sz) {
+    int ci = 0;
+    int in_sq = 0, in_dq = 0;
+
+    in_file[0]  = '\0';
+    out_file[0] = '\0';
+
+    for (int i = 0; line[i]; ) {
+        char c = line[i];
+
+        if (in_sq) {
+            if (ci < cleaned_sz - 1) cleaned[ci++] = c;
+            if (c == '\'') in_sq = 0;
+            i++;
+            continue;
+        }
+
+        if (c == '\\' && line[i+1]) {
+            if (ci < cleaned_sz - 1) cleaned[ci++] = c;
+            if (ci < cleaned_sz - 1) cleaned[ci++] = line[i+1];
+            i += 2;
+            continue;
+        }
+
+        if (in_dq) {
+            if (ci < cleaned_sz - 1) cleaned[ci++] = c;
+            if (c == '"') in_dq = 0;
+            i++;
+            continue;
+        }
+
+        if (c == '\'') { in_sq = 1; if (ci < cleaned_sz-1) cleaned[ci++] = c; i++; continue; }
+        if (c == '"')  { in_dq = 1; if (ci < cleaned_sz-1) cleaned[ci++] = c; i++; continue; }
+
+        if (c == '<' || c == '>') {
+            int j = i + 1;
+            while (line[j] == ' ' || line[j] == '\t') j++;
+
+            char fname[1024]; int fi = 0;
+            char q = 0;
+            if (line[j] == '\'' || line[j] == '"') { q = line[j]; j++; }
+
+            while (line[j] && fi < (int)sizeof(fname) - 1) {
+                if (q) {
+                    if (line[j] == q) { j++; break; }
+                    fname[fi++] = line[j++];
+                } else {
+                    if (line[j] == ' ' || line[j] == '\t' ||
+                        line[j] == '<' || line[j] == '>') break;
+                    if (line[j] == '\\' && line[j+1]) { fname[fi++] = line[j+1]; j += 2; continue; }
+                    fname[fi++] = line[j++];
+                }
+            }
+            fname[fi] = '\0';
+            if (fi == 0) return -1;            /* missing filename */
+
+            if (c == '<') { strncpy(in_file,  fname, in_sz  - 1); in_file [in_sz  - 1] = '\0'; }
+            else          { strncpy(out_file, fname, out_sz - 1); out_file[out_sz - 1] = '\0'; }
+
+            i = j;
+            continue;
+        }
+
+        if (ci < cleaned_sz - 1) cleaned[ci++] = c;
+        i++;
+    }
+
+    cleaned[ci] = '\0';
+    return 0;
+}
+
+
 void execute_command(Tab *tab) {
     if (tab->input_len == 0) return;
 
@@ -271,22 +350,28 @@ void execute_command(Tab *tab) {
     }
 
     // Echo prompt and command
-    char prompt_str[MAX_LINE + 128];
-    snprintf(prompt_str, sizeof(prompt_str), "user@terminator> %s\n", tab->input_line);
-    append_output(tab, prompt_str);
+    char tmp[MAX_OUTPUT];
+        strncpy(tmp, tab->input_line, sizeof(tmp) - 1);
+        tmp[sizeof(tmp) - 1] = '\0';
 
+        int first = 1;
+        char *line = strtok(tmp, "\n");
+        while (line) {
+            char buf[MAX_LINE + 64];
+            snprintf(buf, sizeof(buf), "%s%s\n",
+                     first ? "user@terminator> " : "> ", line);
+            append_output(tab, buf);
+            first = 0;
+            line = strtok(NULL, "\n");
+        }
     // Parse arguments
-    char *args[64];
-    int argc = 0;
+   
     char cmd_copy[MAX_LINE];
     strcpy(cmd_copy, tab->input_line);
 
-    char *token = strtok(cmd_copy, " \t\n");
-    while (token && argc < 63) {
-        args[argc++] = token;
-        token = strtok(NULL, " \t\n");
-    }
-    args[argc] = NULL;
+   char *args[64];
+    static char storage[MAX_LINE * 64];
+    int argc = shell_split(tab->input_line, args, 64, storage, sizeof(storage));
 
     if (argc == 0) {
         tab->input_len = 0;
@@ -320,11 +405,72 @@ void execute_command(Tab *tab) {
             append_output(tab, hist_buf);
         }
         tab->last_exit_status = 0;
-    } else {
-        // External command via fork + execvp + pipe
+       } else {
+        /* ---------- Parse redirections from the raw input ---------- */
+        char cleaned[MAX_OUTPUT];
+        char in_file[1024]  = {0};
+        char out_file[1024] = {0};
+
+        if (parse_redirections(tab->input_line, cleaned, sizeof(cleaned),
+                               in_file, sizeof(in_file),
+                               out_file, sizeof(out_file)) < 0) {
+            append_output(tab, "terminator: syntax error: missing redirection target\n");
+            tab->last_exit_status = 1;
+            tab->input_len = 0;
+            tab->input_line[0] = '\0';
+            return;
+        }
+
+        /* Re-split on the cleaned command */
+        char *args2[64];
+        static char storage2[MAX_LINE * 64];
+        int argc2 = shell_split(cleaned, args2, 64, storage2, sizeof(storage2));
+
+        if (argc2 == 0) {
+            tab->input_len = 0;
+            tab->input_line[0] = '\0';
+            return;
+        }
+
+        /* ---------- Open redirect fds BEFORE forking ---------- */
+        int in_fd  = -1;
+        int out_fd = -1;
+
+        if (in_file[0]) {
+            in_fd = open(in_file, O_RDONLY);
+            if (in_fd < 0) {
+                char err[1200];
+                snprintf(err, sizeof(err),
+                         "terminator: %s: No such file or directory\n", in_file);
+                append_output(tab, err);
+                tab->last_exit_status = 1;
+                tab->input_len = 0;
+                tab->input_line[0] = '\0';
+                return;                       /* DO NOT run the command */
+            }
+        }
+
+        if (out_file[0]) {
+            out_fd = open(out_file, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (out_fd < 0) {
+                char err[1200];
+                snprintf(err, sizeof(err),
+                         "terminator: %s: cannot open for writing\n", out_file);
+                append_output(tab, err);
+                if (in_fd >= 0) close(in_fd);
+                tab->last_exit_status = 1;
+                tab->input_len = 0;
+                tab->input_line[0] = '\0';
+                return;
+            }
+        }
+
+        /* ---------- Fork + exec with redirection ---------- */
         int pipefds[2];
         if (pipe(pipefds) < 0) {
             perror("pipe");
+            if (in_fd  >= 0) close(in_fd);
+            if (out_fd >= 0) close(out_fd);
             tab->last_exit_status = 1;
         } else {
             pid_t pid = fork();
@@ -332,25 +478,43 @@ void execute_command(Tab *tab) {
                 perror("fork");
                 close(pipefds[0]);
                 close(pipefds[1]);
+                if (in_fd  >= 0) close(in_fd);
+                if (out_fd >= 0) close(out_fd);
                 tab->last_exit_status = 1;
             } else if (pid == 0) {
-                // Child process
-                dup2(pipefds[1], STDOUT_FILENO);
+                /* stdin: redirected file if any */
+                if (in_fd >= 0) {
+                    dup2(in_fd, STDIN_FILENO);
+                    close(in_fd);
+                }
+
+                /* stdout: redirected file if any, else tab pipe */
+                if (out_fd >= 0) {
+                    dup2(out_fd, STDOUT_FILENO);
+                    close(out_fd);
+                } else {
+                    dup2(pipefds[1], STDOUT_FILENO);
+                }
+
+                /* stderr always to the tab pipe */
                 dup2(pipefds[1], STDERR_FILENO);
+
                 close(pipefds[0]);
                 close(pipefds[1]);
 
                 chdir(tab->cwd);
-                execvp(args[0], args);
+                execvp(args2[0], args2);
 
-                // If execvp fails
-                fprintf(stderr, "terminator: %s: command not found\n", args[0]);
+                fprintf(stderr, "terminator: %s: command not found\n", args2[0]);
                 _exit(127);
             } else {
-                // Parent process
+                /* parent */
                 close(pipefds[1]);
+                if (in_fd  >= 0) close(in_fd);
+                if (out_fd >= 0) close(out_fd);
+
                 tab->pipe_fd = pipefds[0];
-                tab->pid = pid;
+                tab->pid     = pid;
             }
         }
     }
@@ -427,12 +591,31 @@ void redraw(Display *display, Window window, GC gc, int screen) {
         XDrawString(display, window, gc, 10, text_y, line_buf, strlen(line_buf));
         text_y += 18;
     }
+     if (t->multiline && t->multiline_len > 0) {
+        char copy[MAX_OUTPUT];
+        strncpy(copy, t->multiline_buf, sizeof(copy) - 1);
+        copy[sizeof(copy) - 1] = '\0';
 
-    // Draw active prompt and current input
+        int first = 1;
+        char *line = strtok(copy, "\n");
+        while (line) {
+            char shown[MAX_LINE + 64];
+            snprintf(shown, sizeof(shown), "%s%s",
+                     first ? "user@terminator> " : "> ", line);
+            XDrawString(display, window, gc, 10, text_y, shown, strlen(shown));
+            text_y += 18;
+            first = 0;
+            line = strtok(NULL, "\n");
+        }
+    }
+
+    /* Draw active prompt and current input */
     char current_prompt[MAX_LINE + 64];
-    snprintf(current_prompt, sizeof(current_prompt), "user@terminator> %s", t->input_line);
+    const char *prompt = t->multiline ? "> " : "user@terminator> ";
+    snprintf(current_prompt, sizeof(current_prompt), "%s%s", prompt, t->input_line);
     XDrawString(display, window, gc, 10, text_y, current_prompt, strlen(current_prompt));
-     XFlush(display);  
+
+    XFlush(display);
 }
 
 int main(void) {
@@ -557,8 +740,50 @@ int main(void) {
                     }
 
                     if (keysym == XK_Return || keysym == XK_KP_Enter) {
-                        execute_command(t);
-                    } else if (keysym == XK_BackSpace) {
+
+                            if (t->multiline) {
+                                if (t->multiline_len + t->input_len + 2 < (int)sizeof(t->multiline_buf)) {
+                                    memcpy(t->multiline_buf + t->multiline_len,
+                                        t->input_line, t->input_len);
+                                    t->multiline_len += t->input_len;
+                                    t->multiline_buf[t->multiline_len++] = '\n';
+                                    t->multiline_buf[t->multiline_len]   = '\0';
+                                }
+                            } else {
+                                strncpy(t->multiline_buf, t->input_line, sizeof(t->multiline_buf) - 1);
+                                t->multiline_buf[sizeof(t->multiline_buf) - 1] = '\0';
+                                t->multiline_len = t->input_len;
+                                t->multiline_buf[t->multiline_len++] = '\n';
+                                t->multiline_buf[t->multiline_len]   = '\0';
+                            }
+
+                            if (input_incomplete(t->multiline_buf, t->multiline_len)) {
+                                /* stay in multiline */
+                                t->multiline = 1;
+                                t->input_len = 0;
+                                t->input_line[0] = '\0';
+                            } else {
+                                /* complete: run the full accumulated command */
+                                t->multiline = 0;
+
+                                strncpy(t->input_line, t->multiline_buf, MAX_LINE - 1);
+                                t->input_line[MAX_LINE - 1] = '\0';
+                                t->input_len = strlen(t->input_line);
+
+                                while (t->input_len > 0 &&
+                                    (t->input_line[t->input_len-1] == '\n' ||
+                                        t->input_line[t->input_len-1] == '\r')) {
+                                    t->input_line[--t->input_len] = '\0';
+                                }
+
+                                execute_command(t);
+
+                                t->multiline_len = 0;
+                                t->multiline_buf[0] = '\0';
+                                t->input_len = 0;
+                                t->input_line[0] = '\0';
+                            }
+                        } else if (keysym == XK_BackSpace) {
                         if (t->input_len > 0) {
                             t->input_len--;
                             t->input_line[t->input_len] = '\0';
