@@ -11,11 +11,18 @@
 #include <pwd.h>
 #include <sys/types.h>
 #include <signal.h>
-#include <glob.h>   
+#include <glob.h>
+#include <time.h>
+#include <sys/time.h>
+#include <errno.h>
 
 #define MAX_PIPELINE 16          /* max commands in one pipeline */
 #define MAX_ARGS     64          /* max argv per command */
 #define MAX_STORAGE  (MAX_LINE * 64)
+#define MAX_WATCH 16
+#define WATCH_INTERVAL 2
+#define WATCH_OUT 8192
+#define WATCH_SEP "----------------------------------------------------"
 
 typedef struct {
     char  in_file[1024];         /* "" if no < redirection */
@@ -30,6 +37,15 @@ typedef struct {
 #define MAX_OUTPUT (4096 * 16)
 #define HISTORY_MAX 50
 
+typedef struct {
+    char cmd[MAX_LINE];
+    int pipe_fd;
+    pid_t pid;
+    int running;
+    time_t next_run;
+    char out_buf[WATCH_OUT];
+    int out_len;
+} WatchCmd;
 
 typedef struct {
     char title[64];
@@ -48,6 +64,10 @@ typedef struct {
     int  multiline;
     char multiline_buf[MAX_OUTPUT];
     int  multiline_len;
+
+    int watching;
+    int nwatch;
+    WatchCmd watches[MAX_WATCH];
 } Tab;
 
 static Tab tabs[MAX_TABS];
@@ -537,6 +557,16 @@ void init_tab(Tab *tab, int id) {
     tab->multiline = 0;
     tab->multiline_len = 0;
     tab->multiline_buf[0] = '\0';
+    tab->watching = 0;
+    tab->nwatch = 0;
+    for (int i = 0; i < MAX_WATCH; i++) {
+        tab->watches[i].pipe_fd = -1;
+        tab->watches[i].pid = 0;
+        tab->watches[i].running = 0;
+        tab->watches[i].next_run = 0;
+        tab->watches[i].out_len = 0;
+        tab->watches[i].cmd[0] = '\0';
+    }
 
 
     // char welcome[128];
@@ -574,6 +604,19 @@ void close_tab(int index) {
         kill(t->pid, SIGTERM);
         waitpid(t->pid, NULL, 0);
         t->pid = 0;
+    }
+    if (t->watching) {
+        for (int i = 0; i < t->nwatch; i++) {
+            WatchCmd *w = &t->watches[i];
+            if (w->pipe_fd >= 0) { close(w->pipe_fd); w->pipe_fd = -1; }
+            if (w->pid > 0) {
+                kill(-w->pid, SIGKILL);
+                waitpid(w->pid, NULL, WNOHANG);
+                w->pid = 0;
+            }
+        }
+        t->watching = 0;
+        t->nwatch = 0;
     }
 
    int moved = num_tabs - index - 1;
@@ -636,6 +679,226 @@ static int input_incomplete(const char *s, int len) {
 
 
 
+
+static int parse_multiwatch_cmds(const char *line, char cmds[][MAX_LINE], int maxn) {
+    const char *p = line;
+    while (*p == ' ' || *p == '\t') p++;
+    if (strncmp(p, "multiWatch", 10) != 0) return -1;
+    p += 10;
+    if (*p && *p != ' ' && *p != '\t' && *p != '[') return -1;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p != '[') return -1;
+    p++;
+
+    int n = 0;
+    while (*p) {
+        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == ',') p++;
+        if (*p == ']') break;
+        if (*p != '"') return -1;
+        p++;
+        if (n >= maxn) return -1;
+        int i = 0;
+        while (*p && *p != '"') {
+            if (i < MAX_LINE - 1) cmds[n][i++] = *p;
+            p++;
+        }
+        if (*p != '"') return -1;
+        p++;
+        cmds[n][i] = '\0';
+        if (cmds[n][0]) n++;
+        while (*p == ' ' || *p == '\t' || *p == '\n') p++;
+        if (*p == ',') { p++; continue; }
+        if (*p == ']') break;
+        if (*p) return -1;
+    }
+    if (*p != ']') return -1;
+    return n;
+}
+
+static void print_watch_block(Tab *tab, WatchCmd *w) {
+    char hdr[MAX_LINE + 64];
+    snprintf(hdr, sizeof(hdr), "\"%s\", %ld:\n", w->cmd, (long)time(NULL));
+    append_output(tab, hdr);
+    append_output(tab, WATCH_SEP "\n");
+    if (w->out_len > 0) {
+        append_output(tab, w->out_buf);
+        if (w->out_buf[w->out_len - 1] != '\n')
+            append_output(tab, "\n");
+    }
+    append_output(tab, WATCH_SEP "\n");
+}
+
+static int start_watch_cmd(Tab *tab, int idx) {
+    WatchCmd *w = &tab->watches[idx];
+    int pfd[2];
+    if (pipe(pfd) < 0) return -1;
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(pfd[0]);
+        close(pfd[1]);
+        return -1;
+    }
+    if (pid == 0) {
+        setpgid(0, 0);
+        close(pfd[0]);
+        dup2(pfd[1], STDOUT_FILENO);
+        dup2(pfd[1], STDERR_FILENO);
+        close(pfd[1]);
+        if (chdir(tab->cwd) < 0) _exit(126);
+        execl("/bin/sh", "sh", "-c", w->cmd, (char *)NULL);
+        _exit(127);
+    }
+    setpgid(pid, pid);
+    close(pfd[1]);
+    int flags = fcntl(pfd[0], F_GETFL, 0);
+    if (flags >= 0) fcntl(pfd[0], F_SETFL, flags | O_NONBLOCK);
+    w->pipe_fd = pfd[0];
+    w->pid = pid;
+    w->running = 1;
+    w->next_run = 0;
+    w->out_len = 0;
+    w->out_buf[0] = '\0';
+    return 0;
+}
+
+static void stop_multiwatch(Tab *tab, int show_cc) {
+    for (int i = 0; i < tab->nwatch; i++) {
+        WatchCmd *w = &tab->watches[i];
+        if (w->pid > 0) {
+            kill(-w->pid, SIGINT);
+            kill(-w->pid, SIGKILL);
+            waitpid(w->pid, NULL, 0);
+            w->pid = 0;
+        }
+        if (w->pipe_fd >= 0) {
+            close(w->pipe_fd);
+            w->pipe_fd = -1;
+        }
+        w->running = 0;
+        w->next_run = 0;
+        w->out_len = 0;
+    }
+    tab->watching = 0;
+    tab->nwatch = 0;
+    if (show_cc) append_output(tab, "^C\n");
+}
+
+static void finish_watch_cmd(Tab *tab, WatchCmd *w) {
+    if (w->pipe_fd >= 0) {
+        close(w->pipe_fd);
+        w->pipe_fd = -1;
+    }
+    if (w->pid > 0) {
+        int status;
+        waitpid(w->pid, &status, 0);
+        w->pid = 0;
+    }
+    print_watch_block(tab, w);
+    w->running = 0;
+    w->out_len = 0;
+    w->out_buf[0] = '\0';
+    w->next_run = time(NULL) + WATCH_INTERVAL;
+}
+
+static int drain_watch_cmd(Tab *tab, WatchCmd *w) {
+    char buf[512];
+    int got = 0;
+    for (;;) {
+        ssize_t n = read(w->pipe_fd, buf, sizeof(buf) - 1);
+        if (n > 0) {
+            got = 1;
+            if (w->out_len + (int)n < WATCH_OUT - 1) {
+                memcpy(w->out_buf + w->out_len, buf, (size_t)n);
+                w->out_len += (int)n;
+                w->out_buf[w->out_len] = '\0';
+            } else if (w->out_len < WATCH_OUT - 1) {
+                int room = WATCH_OUT - 1 - w->out_len;
+                memcpy(w->out_buf + w->out_len, buf, (size_t)room);
+                w->out_len += room;
+                w->out_buf[w->out_len] = '\0';
+            }
+            continue;
+        }
+        if (n == 0) {
+            finish_watch_cmd(tab, w);
+            return 1;
+        }
+        if (errno == EINTR) continue;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+        finish_watch_cmd(tab, w);
+        return 1;
+    }
+    return got;
+}
+
+static void restart_due_watches(Tab *tab) {
+    if (!tab->watching) return;
+    time_t now = time(NULL);
+    for (int i = 0; i < tab->nwatch; i++) {
+        WatchCmd *w = &tab->watches[i];
+        if (!w->running && w->next_run != 0 && now >= w->next_run)
+            start_watch_cmd(tab, i);
+    }
+}
+
+static time_t next_watch_deadline(void) {
+    time_t soonest = 0;
+    for (int t = 0; t < num_tabs; t++) {
+        if (!tabs[t].watching) continue;
+        for (int i = 0; i < tabs[t].nwatch; i++) {
+            WatchCmd *w = &tabs[t].watches[i];
+            if (!w->running && w->next_run != 0) {
+                if (soonest == 0 || w->next_run < soonest)
+                    soonest = w->next_run;
+            }
+        }
+    }
+    return soonest;
+}
+
+static int start_multiwatch(Tab *tab, const char *line) {
+    char cmds[MAX_WATCH][MAX_LINE];
+    int n = parse_multiwatch_cmds(line, cmds, MAX_WATCH);
+    if (n < 0) {
+        append_output(tab, "terminator: multiWatch: syntax error, expected multiWatch [\"cmd1\", \"cmd2\", ...]\n");
+        tab->last_exit_status = 1;
+        return -1;
+    }
+    if (n == 0) {
+        append_output(tab, "terminator: multiWatch: no commands\n");
+        tab->last_exit_status = 1;
+        return -1;
+    }
+    if (tab->watching) {
+        append_output(tab, "terminator: multiWatch: already running (Ctrl+C to stop)\n");
+        return -1;
+    }
+    if (tab->pipe_fd != -1) {
+        append_output(tab, "terminator: a command is already running in this tab\n");
+        return -1;
+    }
+
+    tab->nwatch = n;
+    tab->watching = 1;
+    for (int i = 0; i < n; i++) {
+        strncpy(tab->watches[i].cmd, cmds[i], MAX_LINE - 1);
+        tab->watches[i].cmd[MAX_LINE - 1] = '\0';
+        tab->watches[i].pipe_fd = -1;
+        tab->watches[i].pid = 0;
+        tab->watches[i].running = 0;
+        tab->watches[i].next_run = 0;
+        tab->watches[i].out_len = 0;
+        if (start_watch_cmd(tab, i) < 0) {
+            append_output(tab, "terminator: multiWatch: failed to start a command\n");
+            stop_multiwatch(tab, 0);
+            tab->last_exit_status = 1;
+            return -1;
+        }
+    }
+    tab->last_exit_status = 0;
+    return 0;
+}
 
 void execute_command(Tab *tab) {
     if (tab->input_len == 0) return;
@@ -704,7 +967,9 @@ void execute_command(Tab *tab) {
             append_output(tab, hist_buf);
         }
         tab->last_exit_status = 0;
-       } else {
+    } else if (strcmp(args[0], "multiWatch") == 0) {
+        start_multiwatch(tab, tab->input_line);
+    } else {
         char cmd_copy[MAX_OUTPUT];
             strncpy(cmd_copy, tab->input_line, sizeof(cmd_copy) - 1);
             cmd_copy[sizeof(cmd_copy) - 1] = '\0';
@@ -856,11 +1121,34 @@ int main(void) {
                 FD_SET(tabs[i].pipe_fd, &rfds);
                 if (tabs[i].pipe_fd > max_fd) max_fd = tabs[i].pipe_fd;
             }
+            if (tabs[i].watching) {
+                for (int w = 0; w < tabs[i].nwatch; w++) {
+                    int fd = tabs[i].watches[w].pipe_fd;
+                    if (fd >= 0) {
+                        FD_SET(fd, &rfds);
+                        if (fd > max_fd) max_fd = fd;
+                    }
+                }
+            }
         }
 
-        // Use select() to avoid busy-waiting
-        int retval = select(max_fd + 1, &rfds, NULL, NULL, NULL);
-        if (retval < 0) break;
+        struct timeval tv, *tvp = NULL;
+        time_t deadline = next_watch_deadline();
+        if (deadline != 0) {
+            time_t now = time(NULL);
+            long wait_s = deadline - now;
+            if (wait_s < 0) wait_s = 0;
+            tv.tv_sec = wait_s;
+            tv.tv_usec = 0;
+            tvp = &tv;
+        }
+
+        // Use select() to avoid busy-waiting (timeout wakes us to re-run watches)
+        int retval = select(max_fd + 1, &rfds, NULL, NULL, tvp);
+        if (retval < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
 
         // Check X11 events
         if (FD_ISSET(x11_fd, &rfds) || XPending(display)) {
@@ -917,6 +1205,21 @@ int main(void) {
 
                     Bool ctrl = (event.xkey.state & ControlMask) != 0;
 
+                    if (ctrl && (keysym == XK_c || keysym == XK_C)) {
+                        if (t->watching) {
+                            stop_multiwatch(t, 1);
+                        } else if (t->pid > 0) {
+                            kill(t->pid, SIGINT);
+                            append_output(t, "^C\n");
+                        } else {
+                            t->input_len = 0;
+                            t->input_line[0] = '\0';
+                            append_output(t, "^C\n");
+                        }
+                        redraw(display, window, gc, scr);
+                        continue;
+                    }
+
                     if (ctrl && (keysym == XK_w || keysym == XK_W)) {
                         close_tab(current_tab);
                         redraw(display, window, gc, scr);
@@ -934,6 +1237,10 @@ int main(void) {
                     }
 
                     if (keysym == XK_Return || keysym == XK_KP_Enter) {
+                            if (t->watching) {
+                                redraw(display, window, gc, scr);
+                                continue;
+                            }
 
                             if (t->multiline) {
                                 if (t->multiline_len + t->input_len + 2 < (int)sizeof(t->multiline_buf)) {
@@ -996,8 +1303,22 @@ int main(void) {
             }
         }
 
+        for (int i = 0; i < num_tabs; i++)
+            restart_due_watches(&tabs[i]);
+
         // Check background pipes for child output
         for (int i = 0; i < num_tabs; i++) {
+            if (tabs[i].watching) {
+                int changed = 0;
+                for (int w = 0; w < tabs[i].nwatch; w++) {
+                    WatchCmd *wc = &tabs[i].watches[w];
+                    if (wc->pipe_fd >= 0 && FD_ISSET(wc->pipe_fd, &rfds)) {
+                        if (drain_watch_cmd(&tabs[i], wc))
+                            changed = 1;
+                    }
+                }
+                if (changed) redraw(display, window, gc, scr);
+            }
             if (tabs[i].pipe_fd != -1 && FD_ISSET(tabs[i].pipe_fd, &rfds)) {
                 char read_buf[256];
                 int n = read(tabs[i].pipe_fd, read_buf, sizeof(read_buf) - 1);
