@@ -11,6 +11,19 @@
 #include <pwd.h>
 #include <sys/types.h>
 #include <signal.h>
+#include <glob.h>   
+
+#define MAX_PIPELINE 16          /* max commands in one pipeline */
+#define MAX_ARGS     64          /* max argv per command */
+#define MAX_STORAGE  (MAX_LINE * 64)
+
+typedef struct {
+    char  in_file[1024];         /* "" if no < redirection */
+    char  out_file[1024];        /* "" if no > redirection */
+    char *argv[MAX_ARGS];
+     int   argc;     
+} Command;
+
 
 #define MAX_TABS 5
 #define MAX_LINE 256
@@ -55,6 +68,449 @@ void append_output(Tab *tab, const char *str) {
         tab->output_len += len;
     }
 }
+/* Split a complete command line into argv with shell quoting rules.
+ * Caller supplies args[] and storage. Returns argc. */
+static int shell_split(const char *line, char **args, int maxargs,
+                       char *storage, int storage_sz) {
+    int argc = 0, si = 0, ci = 0, have_word = 0;
+    char cur[MAX_LINE];
+
+    for (int i = 0; line[i] && argc < maxargs - 1; ) {
+        char c = line[i];
+
+        if (c == ' ' || c == '\t' || c == '\n') {
+            if (have_word) {
+                cur[ci] = '\0';
+                int need = ci + 1;
+                if (si + need > storage_sz) break;
+                memcpy(storage + si, cur, need);
+                args[argc++] = storage + si;
+                si += need;
+                ci = 0;
+                have_word = 0;
+            }
+            i++;
+            continue;
+        }
+
+        if (c == '\'') {
+            have_word = 1; i++;
+            while (line[i] && line[i] != '\'') {
+                if (ci < (int)sizeof(cur) - 1) cur[ci++] = line[i];
+                i++;
+            }
+            if (line[i] == '\'') i++;
+            continue;
+        }
+
+        if (c == '"') {
+            have_word = 1; i++;
+            while (line[i] && line[i] != '"') {
+                if (line[i] == '\\' && line[i+1]) {
+                    char n = line[i+1];
+                    if (n == '"' || n == '\\' || n == '$' || n == '`') {
+                        if (ci < (int)sizeof(cur) - 1) cur[ci++] = n;
+                        i += 2;
+                        continue;
+                    }
+                    if (n == '\n') { i += 2; continue; } /* continuation */
+                }
+                if (ci < (int)sizeof(cur) - 1) cur[ci++] = line[i];
+                i++;
+            }
+            if (line[i] == '"') i++;
+            continue;
+        }
+
+        if (c == '\\' && line[i+1]) {
+            have_word = 1;
+            char n = line[i+1];
+            if (n == '\n') { i += 2; continue; }   /* continuation */
+            if (ci < (int)sizeof(cur) - 1) cur[ci++] = n;
+            i += 2;
+            continue;
+        }
+
+        have_word = 1;
+        if (ci < (int)sizeof(cur) - 1) cur[ci++] = c;
+        i++;
+    }
+
+    if (have_word && argc < maxargs - 1) {
+        cur[ci] = '\0';
+        int need = ci + 1;
+        if (si + need <= storage_sz) {
+            memcpy(storage + si, cur, need);
+            args[argc++] = storage + si;
+        }
+    }
+
+    args[argc] = NULL;
+    return argc;
+}
+
+/* Expand wildcard arguments in argv[] in place.
+ * Non-matching args are kept literally (POSIX shell behaviour).
+ * Returns the new argc. */
+static int expand_globs(char **argv, int argc,
+                        char **new_argv, int new_max) {
+    int out = 0;
+
+    for (int i = 0; i < argc; i++) {
+        const char *arg = argv[i];
+
+        /* Only bother if the arg has a glob metachar and isn't quoted...
+         * (Your shell_split already stripped quotes, so we can't tell.
+         *  For simplicity: glob only args that contain a metachar. */
+        if (!strpbrk(arg, "*?[")) {
+            if (out < new_max - 1) new_argv[out++] = argv[i];
+            continue;
+        }
+
+        glob_t g;
+        int rc = glob(arg, GLOB_NOCHECK, NULL, &g);
+        if (rc == 0) {
+            for (size_t k = 0; k < g.gl_pathc && out < new_max - 1; k++) {
+                new_argv[out++] = strdup(g.gl_pathv[k]);
+            }
+            globfree(&g);
+        } else {
+            if (out < new_max - 1) new_argv[out++] = argv[i];
+        }
+    }
+
+    new_argv[out] = NULL;
+    return out;
+}
+
+
+/* Extract unquoted < file and > file from a raw command line.
+ * Everything else (including quotes and $() content) is copied to `cleaned`.
+ * Returns 0 on success, -1 on missing filename. */
+ int parse_redirections(const char *line,
+                              char *cleaned, int cleaned_sz,
+                              char *in_file,  int in_sz,
+                              char *out_file, int out_sz) {
+    int ci = 0;
+    int in_sq = 0, in_dq = 0;
+
+    in_file[0]  = '\0';
+    out_file[0] = '\0';
+
+    for (int i = 0; line[i]; ) {
+        char c = line[i];
+
+        if (in_sq) {
+            if (ci < cleaned_sz - 1) cleaned[ci++] = c;
+            if (c == '\'') in_sq = 0;
+            i++;
+            continue;
+        }
+
+        if (c == '\\' && line[i+1]) {
+            if (ci < cleaned_sz - 1) cleaned[ci++] = c;
+            if (ci < cleaned_sz - 1) cleaned[ci++] = line[i+1];
+            i += 2;
+            continue;
+        }
+
+        if (in_dq) {
+            if (ci < cleaned_sz - 1) cleaned[ci++] = c;
+            if (c == '"') in_dq = 0;
+            i++;
+            continue;
+        }
+
+        if (c == '\'') { in_sq = 1; if (ci < cleaned_sz-1) cleaned[ci++] = c; i++; continue; }
+        if (c == '"')  { in_dq = 1; if (ci < cleaned_sz-1) cleaned[ci++] = c; i++; continue; }
+
+        if (c == '<' || c == '>') {
+            int j = i + 1;
+            while (line[j] == ' ' || line[j] == '\t') j++;
+
+            char fname[1024]; int fi = 0;
+            char q = 0;
+            if (line[j] == '\'' || line[j] == '"') { q = line[j]; j++; }
+
+            while (line[j] && fi < (int)sizeof(fname) - 1) {
+                if (q) {
+                    if (line[j] == q) { j++; break; }
+                    fname[fi++] = line[j++];
+                } else {
+                    if (line[j] == ' ' || line[j] == '\t' ||
+                        line[j] == '<' || line[j] == '>') break;
+                    if (line[j] == '\\' && line[j+1]) { fname[fi++] = line[j+1]; j += 2; continue; }
+                    fname[fi++] = line[j++];
+                }
+            }
+            fname[fi] = '\0';
+            if (fi == 0) return -1;            /* missing filename */
+
+            if (c == '<') { strncpy(in_file,  fname, in_sz  - 1); in_file [in_sz  - 1] = '\0'; }
+            else          { strncpy(out_file, fname, out_sz - 1); out_file[out_sz - 1] = '\0'; }
+
+            i = j;
+            continue;
+        }
+
+        if (ci < cleaned_sz - 1) cleaned[ci++] = c;
+        i++;
+    }
+
+    cleaned[ci] = '\0';
+    return 0;
+}
+
+
+
+/* Parse a single pipeline segment into a Command.
+ * Returns 0 on success, -1 on error (missing redirection target). */
+ int parse_command(const char *segment, Command *cmd,
+                         char *storage, int storage_sz) {
+    char cleaned[MAX_OUTPUT];
+
+    if (parse_redirections(segment, cleaned, sizeof(cleaned),
+                           cmd->in_file,  sizeof(cmd->in_file),
+                           cmd->out_file, sizeof(cmd->out_file)) < 0)
+        return -1;
+
+    int argc = shell_split(cleaned, cmd->argv, MAX_ARGS, storage, storage_sz);
+        cmd->argv[argc] = NULL;
+        cmd->argc = argc;
+        return 0;
+}
+
+/* Split `line` on top-level '|' chars (not inside quotes / after backslash).
+ * Writes pointers into `out` and NUL-terminates each segment in-place.
+ * Returns count, or -1 if too many segments. */
+ int split_pipeline(char *line, char **out, int max_out) {
+    int count = 0;
+    int in_sq = 0, in_dq = 0;
+
+    out[count++] = line;
+
+    for (int i = 0; line[i]; i++) {
+        char c = line[i];
+
+        if (in_sq) { if (c == '\'') in_sq = 0; continue; }
+        if (c == '\\') { i++; continue; }        /* skip escaped char */
+        if (in_dq) { if (c == '"') in_dq = 0; continue; }
+        if (c == '\'') { in_sq = 1; continue; }
+        if (c == '"')  { in_dq = 1; continue; }
+
+        if (c == '|') {
+            if (count >= max_out) return -1;
+            line[i] = '\0';
+            out[count++] = &line[i + 1];
+        }
+    }
+    return count;
+}
+
+
+/* Open redirection fds for `cmd`. Fills *in_fd / *out_fd (-1 if unused).
+ * Returns 0 on success, -1 on error (message already appended). */
+ int open_redirections(Tab *tab, Command *cmd, int *in_fd, int *out_fd) {
+    *in_fd = -1;
+    *out_fd = -1;
+
+    if (cmd->in_file[0]) {
+        *in_fd = open(cmd->in_file, O_RDONLY);
+        if (*in_fd < 0) {
+            char err[1200];
+            snprintf(err, sizeof(err),
+                     "terminator: %s: No such file or directory\n", cmd->in_file);
+            append_output(tab, err);
+            return -1;
+        }
+    }
+    if (cmd->out_file[0]) {
+        *out_fd = open(cmd->out_file, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (*out_fd < 0) {
+            char err[1200];
+            snprintf(err, sizeof(err),
+                     "terminator: %s: cannot open for writing\n", cmd->out_file);
+            append_output(tab, err);
+            if (*in_fd >= 0) close(*in_fd);
+            *in_fd = -1;
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* Fork + exec a single command in the pipeline.
+ *   prev_read  : read end of previous pipe (-1 for first stage)
+ *   next_write : write end of next pipe (-1 for last stage)
+ *   out_fd     : file redirect for stdout (-1 = use next_write / parent pipe)
+ * Returns child pid, or -1 on error. */
+ pid_t spawn_child(Tab *tab, Command *cmd,
+                         int prev_read, int next_write, int out_fd) {
+    pid_t pid = fork();
+    if (pid != 0) return pid;     /* parent or error */
+
+    /* --- child --- */
+    if (prev_read >= 0) {
+        dup2(prev_read, STDIN_FILENO);
+    } else if (cmd->in_file[0] == '\0' && tab->pipe_fd != -1) {
+        /* no pipe before us, but shell may already have an in_fd — handled by caller */
+    }
+
+    /* stdout: file redirect wins, else pipe to next stage */
+    if (out_fd >= 0) {
+        dup2(out_fd, STDOUT_FILENO);
+    } else if (next_write >= 0) {
+        dup2(next_write, STDOUT_FILENO);
+    }
+
+    /* stderr always goes to the tab's pipe (via next_write or the
+     * caller-provided stderr_fd). */
+    if (next_write >= 0) dup2(next_write, STDERR_FILENO);
+
+    /* close every inherited pipe fd */
+    /* (caller passes them via globals, or we close a known range — see below) */
+
+    chdir(tab->cwd);
+    execvp(cmd->argv[0], cmd->argv);
+    fprintf(stderr, "terminator: %s: command not found\n", cmd->argv[0]);
+    _exit(127);
+}
+
+/* Run a command line that may contain '|' pipelines and redirections.
+ * Returns exit status of the LAST command (or 1 on setup error). */
+static int execute_pipeline(Tab *tab, char *line) {
+    /* 1) Split on '|' */
+    char *segments[MAX_PIPELINE];
+    int n = split_pipeline(line, segments, MAX_PIPELINE);
+    if (n <= 0) {
+        append_output(tab, "terminator: syntax error: too many pipes\n");
+        return 1;
+    }
+
+    /* 2) Parse each segment (redirections + argv) */
+    static char storage[MAX_PIPELINE][MAX_STORAGE];
+    Command cmds[MAX_PIPELINE];
+
+    for (int i = 0; i < n; i++) {
+        if (parse_command(segments[i], &cmds[i],
+                          storage[i], sizeof(storage[i])) < 0) {
+            append_output(tab, "terminator: syntax error: missing redirection target\n");
+            return 1;
+        }
+        if (cmds[i].argv[0] == NULL) {
+            append_output(tab, "terminator: syntax error: empty command in pipeline\n");
+            return 1;
+        }
+    }
+    static char *glob_storage[MAX_PIPELINE][MAX_ARGS];
+
+    for (int i = 0; i < n; i++) {
+        int newc = expand_globs(cmds[i].argv, cmds[i].argc,
+                                glob_storage[i], MAX_ARGS);
+        /* Repoint argv at the expanded array */
+        memcpy(cmds[i].argv, glob_storage[i], sizeof(char*) * (newc + 1));
+        cmds[i].argc = newc;
+    }
+
+    /* 3) Create n-1 pipes */
+    int pipes[MAX_PIPELINE - 1][2];
+    for (int i = 0; i < n - 1; i++) {
+        if (pipe(pipes[i]) < 0) {
+            perror("pipe");
+            for (int j = 0; j < i; j++) {
+                close(pipes[j][0]); close(pipes[j][1]);
+            }
+            return 1;
+        }
+    }
+
+    /* 4) Open all redirections up-front (so failures abort cleanly) */
+    int  in_fds[MAX_PIPELINE];
+    int out_fds[MAX_PIPELINE];
+    for (int i = 0; i < n; i++) {
+        if (open_redirections(tab, &cmds[i], &in_fds[i], &out_fds[i]) < 0) {
+            for (int j = 0; j < n - 1; j++) {
+                close(pipes[j][0]); close(pipes[j][1]);
+            }
+            for (int j = 0; j < i; j++) {
+                if (in_fds[j]  >= 0) close(in_fds[j]);
+                if (out_fds[j] >= 0) close(out_fds[j]);
+            }
+            return 1;
+        }
+    }
+
+    /* 5) One pipe for the tab to capture the FINAL command's stdout+stderr */
+    int capture[2];
+    if (pipe(capture) < 0) { perror("pipe"); /* cleanup… */ return 1; }
+
+    /* 6) Fork every stage */
+    pid_t pids[MAX_PIPELINE];
+    for (int i = 0; i < n; i++) {
+        int prev_read  = (i > 0)        ? pipes[i - 1][0] : -1;
+        int next_write = (i < n - 1)    ? pipes[i][1]     : -1;
+
+        pid_t pid = fork();
+        if (pid < 0) { perror("fork"); /* cleanup… */ return 1; }
+
+        if (pid == 0) {
+            /* ---- CHILD ---- */
+            if (in_fds[i] >= 0)         dup2(in_fds[i], STDIN_FILENO);
+            else if (prev_read >= 0)    dup2(prev_read, STDIN_FILENO);
+
+            /* stdout: file redirect > next pipe > capture pipe (last stage) */
+            if (out_fds[i] >= 0) {
+                dup2(out_fds[i], STDOUT_FILENO);
+            } else if (next_write >= 0) {
+                dup2(next_write, STDOUT_FILENO);       /* into the next stage */
+            } else {
+                dup2(capture[1], STDOUT_FILENO);       /* last stage → tab display */
+            }
+
+            /* stderr always goes to the tab's capture pipe — never into a stage pipe */
+            dup2(capture[1], STDERR_FILENO);
+
+            /* close ALL inherited pipe + redirect fds */
+            for (int k = 0; k < n - 1; k++) {
+                close(pipes[k][0]); close(pipes[k][1]);
+            }
+            close(capture[0]); close(capture[1]);
+            for (int k = 0; k < n; k++) {
+                if (in_fds[k]  >= 0) close(in_fds[k]);
+                if (out_fds[k] >= 0) close(out_fds[k]);
+            }
+
+            chdir(tab->cwd);
+            execvp(cmds[i].argv[0], cmds[i].argv);
+            fprintf(stderr, "terminator: %s: command not found\n", cmds[i].argv[0]);
+            _exit(127);
+        }
+        pids[i] = pid;
+    }
+
+    /* 7) Parent: close everything it doesn't need */
+    for (int i = 0; i < n - 1; i++) {
+        close(pipes[i][0]); close(pipes[i][1]);
+    }
+    close(capture[1]);
+    for (int i = 0; i < n; i++) {
+        if (in_fds[i]  >= 0) close(in_fds[i]);
+        if (out_fds[i] >= 0) close(out_fds[i]);
+    }
+
+    /* 8) Hand the capture read-end to the tab so the event loop drains it */
+    tab->pipe_fd = capture[0];
+    tab->pid     = pids[n - 1];   /* reaped by the loop */
+
+    /* Reap all but the last; the last is reaped when capture hits EOF. */
+    for (int i = 0; i < n - 1; i++) {
+        waitpid(pids[i], NULL, 0);
+    }
+
+    return 0;
+}
+
+
 
 void update_tab_title(Tab *tab) {
     char *home = getenv("HOME");
@@ -178,164 +634,7 @@ static int input_incomplete(const char *s, int len) {
     return 0;
 }
 
-/* Split a complete command line into argv with shell quoting rules.
- * Caller supplies args[] and storage. Returns argc. */
-static int shell_split(const char *line, char **args, int maxargs,
-                       char *storage, int storage_sz) {
-    int argc = 0, si = 0, ci = 0, have_word = 0;
-    char cur[MAX_LINE];
 
-    for (int i = 0; line[i] && argc < maxargs - 1; ) {
-        char c = line[i];
-
-        if (c == ' ' || c == '\t' || c == '\n') {
-            if (have_word) {
-                cur[ci] = '\0';
-                int need = ci + 1;
-                if (si + need > storage_sz) break;
-                memcpy(storage + si, cur, need);
-                args[argc++] = storage + si;
-                si += need;
-                ci = 0;
-                have_word = 0;
-            }
-            i++;
-            continue;
-        }
-
-        if (c == '\'') {
-            have_word = 1; i++;
-            while (line[i] && line[i] != '\'') {
-                if (ci < (int)sizeof(cur) - 1) cur[ci++] = line[i];
-                i++;
-            }
-            if (line[i] == '\'') i++;
-            continue;
-        }
-
-        if (c == '"') {
-            have_word = 1; i++;
-            while (line[i] && line[i] != '"') {
-                if (line[i] == '\\' && line[i+1]) {
-                    char n = line[i+1];
-                    if (n == '"' || n == '\\' || n == '$' || n == '`') {
-                        if (ci < (int)sizeof(cur) - 1) cur[ci++] = n;
-                        i += 2;
-                        continue;
-                    }
-                    if (n == '\n') { i += 2; continue; } /* continuation */
-                }
-                if (ci < (int)sizeof(cur) - 1) cur[ci++] = line[i];
-                i++;
-            }
-            if (line[i] == '"') i++;
-            continue;
-        }
-
-        if (c == '\\' && line[i+1]) {
-            have_word = 1;
-            char n = line[i+1];
-            if (n == '\n') { i += 2; continue; }   /* continuation */
-            if (ci < (int)sizeof(cur) - 1) cur[ci++] = n;
-            i += 2;
-            continue;
-        }
-
-        have_word = 1;
-        if (ci < (int)sizeof(cur) - 1) cur[ci++] = c;
-        i++;
-    }
-
-    if (have_word && argc < maxargs - 1) {
-        cur[ci] = '\0';
-        int need = ci + 1;
-        if (si + need <= storage_sz) {
-            memcpy(storage + si, cur, need);
-            args[argc++] = storage + si;
-        }
-    }
-
-    args[argc] = NULL;
-    return argc;
-}
-
-
-/* Extract unquoted < file and > file from a raw command line.
- * Everything else (including quotes and $() content) is copied to `cleaned`.
- * Returns 0 on success, -1 on missing filename. */
-static int parse_redirections(const char *line,
-                              char *cleaned, int cleaned_sz,
-                              char *in_file,  int in_sz,
-                              char *out_file, int out_sz) {
-    int ci = 0;
-    int in_sq = 0, in_dq = 0;
-
-    in_file[0]  = '\0';
-    out_file[0] = '\0';
-
-    for (int i = 0; line[i]; ) {
-        char c = line[i];
-
-        if (in_sq) {
-            if (ci < cleaned_sz - 1) cleaned[ci++] = c;
-            if (c == '\'') in_sq = 0;
-            i++;
-            continue;
-        }
-
-        if (c == '\\' && line[i+1]) {
-            if (ci < cleaned_sz - 1) cleaned[ci++] = c;
-            if (ci < cleaned_sz - 1) cleaned[ci++] = line[i+1];
-            i += 2;
-            continue;
-        }
-
-        if (in_dq) {
-            if (ci < cleaned_sz - 1) cleaned[ci++] = c;
-            if (c == '"') in_dq = 0;
-            i++;
-            continue;
-        }
-
-        if (c == '\'') { in_sq = 1; if (ci < cleaned_sz-1) cleaned[ci++] = c; i++; continue; }
-        if (c == '"')  { in_dq = 1; if (ci < cleaned_sz-1) cleaned[ci++] = c; i++; continue; }
-
-        if (c == '<' || c == '>') {
-            int j = i + 1;
-            while (line[j] == ' ' || line[j] == '\t') j++;
-
-            char fname[1024]; int fi = 0;
-            char q = 0;
-            if (line[j] == '\'' || line[j] == '"') { q = line[j]; j++; }
-
-            while (line[j] && fi < (int)sizeof(fname) - 1) {
-                if (q) {
-                    if (line[j] == q) { j++; break; }
-                    fname[fi++] = line[j++];
-                } else {
-                    if (line[j] == ' ' || line[j] == '\t' ||
-                        line[j] == '<' || line[j] == '>') break;
-                    if (line[j] == '\\' && line[j+1]) { fname[fi++] = line[j+1]; j += 2; continue; }
-                    fname[fi++] = line[j++];
-                }
-            }
-            fname[fi] = '\0';
-            if (fi == 0) return -1;            /* missing filename */
-
-            if (c == '<') { strncpy(in_file,  fname, in_sz  - 1); in_file [in_sz  - 1] = '\0'; }
-            else          { strncpy(out_file, fname, out_sz - 1); out_file[out_sz - 1] = '\0'; }
-
-            i = j;
-            continue;
-        }
-
-        if (ci < cleaned_sz - 1) cleaned[ci++] = c;
-        i++;
-    }
-
-    cleaned[ci] = '\0';
-    return 0;
-}
 
 
 void execute_command(Tab *tab) {
@@ -406,117 +705,12 @@ void execute_command(Tab *tab) {
         }
         tab->last_exit_status = 0;
        } else {
-        /* ---------- Parse redirections from the raw input ---------- */
-        char cleaned[MAX_OUTPUT];
-        char in_file[1024]  = {0};
-        char out_file[1024] = {0};
+        char cmd_copy[MAX_OUTPUT];
+            strncpy(cmd_copy, tab->input_line, sizeof(cmd_copy) - 1);
+            cmd_copy[sizeof(cmd_copy) - 1] = '\0';
 
-        if (parse_redirections(tab->input_line, cleaned, sizeof(cleaned),
-                               in_file, sizeof(in_file),
-                               out_file, sizeof(out_file)) < 0) {
-            append_output(tab, "terminator: syntax error: missing redirection target\n");
-            tab->last_exit_status = 1;
-            tab->input_len = 0;
-            tab->input_line[0] = '\0';
-            return;
-        }
-
-        /* Re-split on the cleaned command */
-        char *args2[64];
-        static char storage2[MAX_LINE * 64];
-        int argc2 = shell_split(cleaned, args2, 64, storage2, sizeof(storage2));
-
-        if (argc2 == 0) {
-            tab->input_len = 0;
-            tab->input_line[0] = '\0';
-            return;
-        }
-
-        /* ---------- Open redirect fds BEFORE forking ---------- */
-        int in_fd  = -1;
-        int out_fd = -1;
-
-        if (in_file[0]) {
-            in_fd = open(in_file, O_RDONLY);
-            if (in_fd < 0) {
-                char err[1200];
-                snprintf(err, sizeof(err),
-                         "terminator: %s: No such file or directory\n", in_file);
-                append_output(tab, err);
-                tab->last_exit_status = 1;
-                tab->input_len = 0;
-                tab->input_line[0] = '\0';
-                return;                       /* DO NOT run the command */
-            }
-        }
-
-        if (out_file[0]) {
-            out_fd = open(out_file, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-            if (out_fd < 0) {
-                char err[1200];
-                snprintf(err, sizeof(err),
-                         "terminator: %s: cannot open for writing\n", out_file);
-                append_output(tab, err);
-                if (in_fd >= 0) close(in_fd);
-                tab->last_exit_status = 1;
-                tab->input_len = 0;
-                tab->input_line[0] = '\0';
-                return;
-            }
-        }
-
-        /* ---------- Fork + exec with redirection ---------- */
-        int pipefds[2];
-        if (pipe(pipefds) < 0) {
-            perror("pipe");
-            if (in_fd  >= 0) close(in_fd);
-            if (out_fd >= 0) close(out_fd);
-            tab->last_exit_status = 1;
-        } else {
-            pid_t pid = fork();
-            if (pid < 0) {
-                perror("fork");
-                close(pipefds[0]);
-                close(pipefds[1]);
-                if (in_fd  >= 0) close(in_fd);
-                if (out_fd >= 0) close(out_fd);
-                tab->last_exit_status = 1;
-            } else if (pid == 0) {
-                /* stdin: redirected file if any */
-                if (in_fd >= 0) {
-                    dup2(in_fd, STDIN_FILENO);
-                    close(in_fd);
-                }
-
-                /* stdout: redirected file if any, else tab pipe */
-                if (out_fd >= 0) {
-                    dup2(out_fd, STDOUT_FILENO);
-                    close(out_fd);
-                } else {
-                    dup2(pipefds[1], STDOUT_FILENO);
-                }
-
-                /* stderr always to the tab pipe */
-                dup2(pipefds[1], STDERR_FILENO);
-
-                close(pipefds[0]);
-                close(pipefds[1]);
-
-                chdir(tab->cwd);
-                execvp(args2[0], args2);
-
-                fprintf(stderr, "terminator: %s: command not found\n", args2[0]);
-                _exit(127);
-            } else {
-                /* parent */
-                close(pipefds[1]);
-                if (in_fd  >= 0) close(in_fd);
-                if (out_fd >= 0) close(out_fd);
-
-                tab->pipe_fd = pipefds[0];
-                tab->pid     = pid;
-            }
-        }
+            int status = execute_pipeline(tab, cmd_copy);
+            if (status != 0) tab->last_exit_status = status;
     }
 
     tab->input_len = 0;
