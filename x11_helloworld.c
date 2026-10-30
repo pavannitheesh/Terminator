@@ -36,6 +36,11 @@ typedef struct {
 #define MAX_LINE 256
 #define MAX_OUTPUT (4096 * 16)
 #define HISTORY_MAX 50
+#define LINE_H 18
+#define CHAR_W 7
+#define PAD_X 10
+#define TEXT_TOP 55
+#define TABBAR_BOTTOM 35
 
 typedef struct {
     char cmd[MAX_LINE];
@@ -68,11 +73,13 @@ typedef struct {
     int watching;
     int nwatch;
     WatchCmd watches[MAX_WATCH];
+    int scroll; /* display lines above the bottom (0 = follow latest) */
 } Tab;
 
 static Tab tabs[MAX_TABS];
 static int num_tabs = 0;
 static int current_tab = 0;
+static int win_w = 800, win_h = 500;
 
 void append_output(Tab *tab, const char *str) {
     int len = strlen(str);
@@ -559,6 +566,7 @@ void init_tab(Tab *tab, int id) {
     tab->multiline_buf[0] = '\0';
     tab->watching = 0;
     tab->nwatch = 0;
+    tab->scroll = 0;
     for (int i = 0; i < MAX_WATCH; i++) {
         tab->watches[i].pipe_fd = -1;
         tab->watches[i].pid = 0;
@@ -978,8 +986,77 @@ void execute_command(Tab *tab) {
             if (status != 0) tab->last_exit_status = status;
     }
 
+    tab->scroll = 0;
     tab->input_len = 0;
     tab->input_line[0] = '\0';
+}
+
+static int char_cols(void) {
+    int cols = (win_w - 2 * PAD_X) / CHAR_W;
+    if (cols < 8) cols = 8;
+    if (cols > MAX_LINE - 1) cols = MAX_LINE - 1;
+    return cols;
+}
+
+static int usable_rows(void) {
+    int h = win_h - TEXT_TOP;
+    int rows = h / LINE_H;
+    return rows < 1 ? 1 : rows;
+}
+
+/* One visual line: wrap at `cols`, treat '\n' as a hard break. */
+static int next_display_line(const char *buf, int len, int *i, int cols, char *out) {
+    if (*i >= len) return 0;
+    int n = 0;
+    while (*i < len && n < cols) {
+        char c = buf[*i];
+        if (c == '\r') { (*i)++; continue; }
+        if (c == '\n') { (*i)++; break; }
+        out[n++] = c;
+        (*i)++;
+    }
+    out[n] = '\0';
+    if (n == cols && *i < len && buf[*i] == '\n')
+        (*i)++;
+    return 1;
+}
+
+static int count_wrapped(const char *buf, int len, int cols) {
+    char line[MAX_LINE];
+    int i = 0, n = 0;
+    while (next_display_line(buf, len, &i, cols, line)) n++;
+    return n;
+}
+
+static int tab_display_lines(Tab *t, int cols) {
+    int n = count_wrapped(t->output_buffer, t->output_len, cols);
+    if (t->multiline && t->multiline_len > 0)
+        n += count_wrapped(t->multiline_buf, t->multiline_len, cols);
+    return n;
+}
+
+static void clamp_scroll(Tab *t) {
+    int cols = char_cols();
+    int rows = usable_rows();
+    int total = tab_display_lines(t, cols);
+    int maxs = total - rows;
+    if (maxs < 0) maxs = 0;
+    if (t->scroll > maxs) t->scroll = maxs;
+    if (t->scroll < 0) t->scroll = 0;
+}
+
+static void draw_wrapped_range(const char *buf, int len, int cols,
+                               int *index, int start, int end,
+                               int *y, Display *display, Window window, GC gc) {
+    char line[MAX_LINE];
+    int i = 0;
+    while (next_display_line(buf, len, &i, cols, line)) {
+        if (*index >= start && *index < end) {
+            XDrawString(display, window, gc, PAD_X, *y, line, (int)strlen(line));
+            *y += LINE_H;
+        }
+        (*index)++;
+    }
 }
 
 void redraw(Display *display, Window window, GC gc, int screen) {
@@ -1026,53 +1103,45 @@ void redraw(Display *display, Window window, GC gc, int screen) {
 
     // Draw separator line
     XSetForeground(display, gc, BlackPixel(display, screen));
-    XDrawLine(display, window, gc, 10, 35, 780, 35);
+    XDrawLine(display, window, gc, 10, TABBAR_BOTTOM, win_w - 10, TABBAR_BOTTOM);
 
-    // Draw Terminal Output and Current Input Line for Current Tab
     Tab *t = &tabs[current_tab];
-    int text_y = 55;
-    
-    // Print output lines
-    char line_buf[MAX_LINE];
-    int line_idx = 0;
-    for (int i = 0; i < t->output_len; i++) {
-        if (t->output_buffer[i] == '\n' || line_idx >= MAX_LINE - 1) {
-            line_buf[line_idx] = '\0';
-            XDrawString(display, window, gc, 10, text_y, line_buf, strlen(line_buf));
-            text_y += 18;
-            line_idx = 0;
-        } else {
-            line_buf[line_idx++] = t->output_buffer[i];
-        }
-    }
-    if (line_idx > 0) {
-        line_buf[line_idx] = '\0';
-        XDrawString(display, window, gc, 10, text_y, line_buf, strlen(line_buf));
-        text_y += 18;
-    }
-     if (t->multiline && t->multiline_len > 0) {
-        char copy[MAX_OUTPUT];
-        strncpy(copy, t->multiline_buf, sizeof(copy) - 1);
-        copy[sizeof(copy) - 1] = '\0';
+    int cols = char_cols();
+    int rows = usable_rows();
+    clamp_scroll(t);
+    int total = tab_display_lines(t, cols);
+    int end = total - t->scroll;
+    if (end < 0) end = 0;
+    if (end > total) end = total;
+    int start = end - rows;
+    if (start < 0) start = 0;
 
-        int first = 1;
-        char *line = strtok(copy, "\n");
-        while (line) {
-            char shown[MAX_LINE + 64];
-            snprintf(shown, sizeof(shown), "%s%s",
-                     first ? "user@terminator> " : "> ", line);
-            XDrawString(display, window, gc, 10, text_y, shown, strlen(shown));
-            text_y += 18;
-            first = 0;
-            line = strtok(NULL, "\n");
-        }
-    }
-
-    /* Draw active prompt and current input */
-    char current_prompt[MAX_LINE + 64];
-    const char *prompt = t->multiline ? "> " : "user@terminator> ";
-    snprintf(current_prompt, sizeof(current_prompt), "%s%s", prompt, t->input_line);
-    XDrawString(display, window, gc, 10, text_y, current_prompt, strlen(current_prompt));
+    int text_y = TEXT_TOP;
+    int index = 0;
+    draw_wrapped_range(t->output_buffer, t->output_len, cols,
+                       &index, start, end, &text_y, display, window, gc);
+    if (t->multiline && t->multiline_len > 0)
+        draw_wrapped_range(t->multiline_buf, t->multiline_len, cols,
+                           &index, start, end, &text_y, display, window, gc);
+                           draw_wrapped_range(t->output_buffer, t->output_len, cols,
+                                              &index, start, end, &text_y, display, window, gc);
+                           if (t->multiline && t->multiline_len > 0)
+                               draw_wrapped_range(t->multiline_buf, t->multiline_len, cols,
+                                                  &index, start, end, &text_y, display, window, gc);
+                       
+                           /* Prompt: only shown when following the latest output (scroll == 0).
+                            * Drawn right after the last output line, like a real terminal. */
+                           if (t->scroll == 0) {
+                               char current_prompt[MAX_LINE + 64];
+                               const char *prompt = t->multiline ? "> " : "user@terminator> ";
+                               snprintf(current_prompt, sizeof(current_prompt), "%s%s", prompt, t->input_line);
+                       
+                               /* Don't draw past the bottom of the window */
+                               if (text_y <= win_h - 4) {
+                                   XDrawString(display, window, gc, PAD_X, text_y,
+                                               current_prompt, (int)strlen(current_prompt));
+                               }
+                           }
 
     XFlush(display);
 }
@@ -1158,11 +1227,26 @@ int main(void) {
 
                 if (event.type == Expose) {
                     redraw(display, window, gc, scr);
+                } else if (event.type == ConfigureNotify) {
+                    if (event.xconfigure.width > 0 && event.xconfigure.height > 0) {
+                        win_w = event.xconfigure.width;
+                        win_h = event.xconfigure.height;
+                        clamp_scroll(&tabs[current_tab]);
+                        redraw(display, window, gc, scr);
+                    }
                 } else if (event.type == ClientMessage && event.xclient.data.l[0] == delete_window) {
                     goto cleanup;
                 } else if (event.type == ButtonPress) {
-                    // Simple click detection for tabs (y < 35)
-                   if (event.xbutton.y < 35) {
+                    Tab *t = &tabs[current_tab];
+                    if (event.xbutton.button == Button4) {
+                        t->scroll += 3;
+                        clamp_scroll(t);
+                        redraw(display, window, gc, scr);
+                    } else if (event.xbutton.button == Button5) {
+                        t->scroll -= 3;
+                        clamp_scroll(t);
+                        redraw(display, window, gc, scr);
+                    } else if (event.xbutton.y < TABBAR_BOTTOM) {
                     int click_x = event.xbutton.x;
                     int x = 5;
                     int hit_tab = -1, hit_close = -1;
@@ -1236,7 +1320,25 @@ int main(void) {
                         continue;
                     }
 
-                    if (keysym == XK_Return || keysym == XK_KP_Enter) {
+                    if (keysym == XK_Prior || keysym == XK_Page_Up) {
+                        t->scroll += usable_rows() - 1;
+                        if (t->scroll < 1) t->scroll = 1;
+                        clamp_scroll(t);
+                    } else if (keysym == XK_Next || keysym == XK_Page_Down) {
+                        t->scroll -= usable_rows() - 1;
+                        clamp_scroll(t);
+                    } else if (keysym == XK_Up) {
+                        t->scroll += 1;
+                        clamp_scroll(t);
+                    } else if (keysym == XK_Down) {
+                        t->scroll -= 1;
+                        clamp_scroll(t);
+                    } else if (keysym == XK_Home) {
+                        t->scroll = 1000000;
+                        clamp_scroll(t);
+                    } else if (keysym == XK_End) {
+                        t->scroll = 0;
+                    } else if (keysym == XK_Return || keysym == XK_KP_Enter) {
                             if (t->watching) {
                                 redraw(display, window, gc, scr);
                                 continue;
