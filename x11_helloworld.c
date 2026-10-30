@@ -1,9 +1,13 @@
 #include <X11/Xlib.h>
 #include <X11/Xutil.h> 
 #include <X11/keysym.h>
+#include <X11/Xatom.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
+#include <stdarg.h>
+#include <ctype.h>
 #include <unistd.h>
 #include <sys/wait.h>
 #include <sys/select.h>
@@ -57,6 +61,9 @@ typedef struct {
     char cwd[1024];
     char input_line[MAX_LINE];
     int input_len;
+    int cursor;                     /* caret position within input_line */
+    int hist_pos;                   /* browse index, -1 when not browsing */
+    char hist_save[MAX_LINE];       /* line saved when history browse starts */
     char output_buffer[MAX_OUTPUT];
     int output_len;
     int last_exit_status;
@@ -70,6 +77,12 @@ typedef struct {
     char multiline_buf[MAX_OUTPUT];
     int  multiline_len;
 
+    /* mouse text selection, in absolute wrapped-display-line coordinates */
+    int sel_active;
+    int sel_dragging;
+    int sel_anchor_line, sel_anchor_col;
+    int sel_line, sel_col;
+
     int watching;
     int nwatch;
     WatchCmd watches[MAX_WATCH];
@@ -80,6 +93,308 @@ static Tab tabs[MAX_TABS];
 static int num_tabs = 0;
 static int current_tab = 0;
 static int win_w = 800, win_h = 500;
+
+/* ===================== configurable key bindings =====================
+ * A table of (modifiers, KeySym) -> action. Loaded from ~/.terminatorrc
+ * at startup and editable at runtime with the `bind` built-in.          */
+
+enum {
+    ACT_NONE = 0,
+    ACT_LEFT, ACT_RIGHT,
+    ACT_LINE_START, ACT_LINE_END,
+    ACT_HIST_UP, ACT_HIST_DOWN,
+    ACT_KILL_TO_START, ACT_KILL_TO_END, ACT_KILL_WORD,
+    ACT_CLEAR_SCREEN, ACT_EXIT, ACT_COPY, ACT_PASTE
+};
+typedef int Action;
+
+typedef struct {
+    KeySym       keysym;   /* normalised (letters stored lower-case) */
+    unsigned int mods;     /* ControlMask | ShiftMask | Mod1Mask */
+    Action       action;
+    int          user;     /* 1 = set from config file / bind command */
+} Binding;
+
+#define MAX_BINDINGS 64
+#define BIND_MODS    (ControlMask | ShiftMask | Mod1Mask)
+
+static Binding bindings[MAX_BINDINGS];
+static int     num_bindings = 0;
+
+static Atom atom_clipboard, atom_utf8, atom_targets, atom_sel_data;
+
+/* messages gathered while parsing the config, shown in the first tab */
+static char config_msgs[MAX_OUTPUT];
+static int  config_msgs_len = 0;
+
+static const struct { const char *name; Action act; } action_table[] = {
+    { "left",               ACT_LEFT },
+    { "right",              ACT_RIGHT },
+    { "line-start",         ACT_LINE_START },
+    { "line-end",           ACT_LINE_END },
+    { "history-up",         ACT_HIST_UP },
+    { "prev-history",       ACT_HIST_UP },
+    { "history-down",       ACT_HIST_DOWN },
+    { "next-history",       ACT_HIST_DOWN },
+    { "kill-to-start",      ACT_KILL_TO_START },
+    { "kill-to-end",        ACT_KILL_TO_END },
+    { "kill-line",          ACT_KILL_TO_END },
+    { "kill-word",          ACT_KILL_WORD },
+    { "backward-kill-word", ACT_KILL_WORD },
+    { "clear-screen",       ACT_CLEAR_SCREEN },
+    { "exit",               ACT_EXIT },
+    { "copy",               ACT_COPY },
+    { "paste",              ACT_PASTE },
+    { NULL, ACT_NONE }
+};
+
+static KeySym norm_keysym(KeySym ks) {
+    if (ks >= XK_A && ks <= XK_Z) return ks - XK_A + XK_a;
+    return ks;
+}
+
+static Action action_from_name(const char *name) {
+    for (int i = 0; action_table[i].name; i++)
+        if (strcasecmp(name, action_table[i].name) == 0)
+            return action_table[i].act;
+    return ACT_NONE;
+}
+
+static const char *action_name(Action a) {
+    for (int i = 0; action_table[i].name; i++)
+        if (action_table[i].act == a) return action_table[i].name;
+    return "?";
+}
+
+static void config_report(const char *fmt, ...) {
+    char buf[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    fputs(buf, stderr);
+    int l = (int)strlen(buf);
+    if (config_msgs_len + l < (int)sizeof(config_msgs) - 1) {
+        memcpy(config_msgs + config_msgs_len, buf, l);
+        config_msgs_len += l;
+        config_msgs[config_msgs_len] = '\0';
+    }
+}
+
+/* "Ctrl+Shift+C" / "Left" -> KeySym + modifier bits. NoSymbol on failure. */
+static KeySym parse_key_spec(const char *spec, unsigned int *mods_out) {
+    char tmp[128];
+    snprintf(tmp, sizeof(tmp), "%s", spec);
+    unsigned int mods = 0;
+    KeySym ks = NoSymbol;
+
+    for (char *tok = strtok(tmp, "+"); tok; tok = strtok(NULL, "+")) {
+        if      (!strcasecmp(tok, "ctrl") || !strcasecmp(tok, "control")) mods |= ControlMask;
+        else if (!strcasecmp(tok, "shift"))                               mods |= ShiftMask;
+        else if (!strcasecmp(tok, "alt") || !strcasecmp(tok, "meta") ||
+                 !strcasecmp(tok, "mod1"))                                mods |= Mod1Mask;
+        else {
+            KeySym k = XStringToKeysym(tok);
+            if (k == NoSymbol && strlen(tok) == 1) {
+                char u[2] = { tok[0], '\0' };
+                k = XStringToKeysym(u);
+            }
+            if (k != NoSymbol) ks = k;
+        }
+    }
+    *mods_out = mods;
+    return norm_keysym(ks);
+}
+
+/* (KeySym, mods) -> "Ctrl+Shift+C" */
+static void format_key(KeySym ks, unsigned int mods, char *out, int outsz) {
+    char base[64];
+    if (ks >= XK_a && ks <= XK_z) {
+        base[0] = (char)(ks - XK_a + 'A');
+        base[1] = '\0';
+    } else {
+        const char *s = XKeysymToString(ks);
+        snprintf(base, sizeof(base), "%s", s ? s : "?");
+    }
+    out[0] = '\0';
+    if (mods & ControlMask) strncat(out, "Ctrl+",  outsz - 1 - strlen(out));
+    if (mods & ShiftMask)   strncat(out, "Shift+", outsz - 1 - strlen(out));
+    if (mods & Mod1Mask)    strncat(out, "Alt+",   outsz - 1 - strlen(out));
+    strncat(out, base, outsz - 1 - strlen(out));
+}
+
+static void add_binding(KeySym ks, unsigned int mods, Action a, int user) {
+    if (num_bindings >= MAX_BINDINGS) return;
+    bindings[num_bindings].keysym = norm_keysym(ks);
+    bindings[num_bindings].mods   = mods & BIND_MODS;
+    bindings[num_bindings].action = a;
+    bindings[num_bindings].user   = user;
+    num_bindings++;
+}
+
+static int find_binding(KeySym ks, unsigned int mods) {
+    ks    = norm_keysym(ks);
+    mods &= BIND_MODS;
+    for (int i = 0; i < num_bindings; i++)
+        if (bindings[i].keysym == ks && bindings[i].mods == mods) return i;
+    return -1;
+}
+
+static int set_binding(KeySym ks, unsigned int mods, Action a, int user) {
+    int i = find_binding(ks, mods);
+    if (i >= 0) {
+        bindings[i].action = a;
+        if (user) bindings[i].user = 1;
+        return i;
+    }
+    add_binding(ks, mods, a, user);
+    return num_bindings - 1;
+}
+
+static void init_default_bindings(void) {
+    num_bindings = 0;
+    add_binding(XK_Left,  0,                       ACT_LEFT,          0);
+    add_binding(XK_Right, 0,                       ACT_RIGHT,         0);
+    add_binding(XK_a,     ControlMask,             ACT_LINE_START,    0);
+    add_binding(XK_e,     ControlMask,             ACT_LINE_END,      0);
+    add_binding(XK_Up,    0,                       ACT_HIST_UP,       0);
+    add_binding(XK_Down,  0,                       ACT_HIST_DOWN,     0);
+    add_binding(XK_u,     ControlMask,             ACT_KILL_TO_START, 0);
+    add_binding(XK_k,     ControlMask,             ACT_KILL_TO_END,   0);
+    add_binding(XK_w,     ControlMask,             ACT_KILL_WORD,     0);
+    add_binding(XK_l,     ControlMask,             ACT_CLEAR_SCREEN,  0);
+    add_binding(XK_d,     ControlMask,             ACT_EXIT,          0);
+    add_binding(XK_c,     ControlMask | ShiftMask, ACT_COPY,          0);
+    add_binding(XK_v,     ControlMask | ShiftMask, ACT_PASTE,         0);
+}
+
+static int config_path(char *buf, int sz) {
+    const char *home = getenv("HOME");
+    if (!home || !*home) return -1;
+    snprintf(buf, sz, "%s/.terminatorrc", home);
+    return 0;
+}
+
+/* Parse ~/.terminatorrc into the binding table.
+ * Invalid or self-conflicting entries are reported and the default kept. */
+static void load_config(void) {
+    typedef struct {
+        KeySym       keysym;
+        unsigned int mods;
+        Action       action;
+        int          line;
+        char         keystr[64];
+    } PendingBind;
+
+    init_default_bindings();
+    config_msgs[0] = '\0';
+    config_msgs_len = 0;
+
+    char path[1200];
+    if (config_path(path, sizeof(path)) < 0) return;
+
+    FILE *f = fopen(path, "r");
+    if (!f) return;                       /* no config file: pure defaults */
+
+    PendingBind pend[MAX_BINDINGS];
+    int np = 0;
+    char line[512];
+    int lineno = 0;
+
+    while (fgets(line, sizeof(line), f)) {
+        lineno++;
+        char *hash = strchr(line, '#');
+        if (hash) *hash = '\0';
+
+        char *s = line;
+        while (*s == ' ' || *s == '\t') s++;
+        char *e = s + strlen(s);
+        while (e > s && (e[-1] == '\n' || e[-1] == '\r' ||
+                         e[-1] == ' '  || e[-1] == '\t')) *--e = '\0';
+        if (!*s) continue;
+
+        if (strncmp(s, "bind", 4) != 0 || (s[4] && !isspace((unsigned char)s[4]))) {
+            config_report("terminator: %s:%d: unknown directive "
+                          "(expected 'bind <key> <action>')\n", path, lineno);
+            continue;
+        }
+        char *p = s + 4;
+        while (*p == ' ' || *p == '\t') p++;
+
+        char key[64] = ""; int ki = 0;
+        while (*p && !isspace((unsigned char)*p) && ki < 63) key[ki++] = *p++;
+        key[ki] = '\0';
+        while (*p == ' ' || *p == '\t') p++;
+
+        char act[64] = ""; int ai = 0;
+        while (*p && !isspace((unsigned char)*p) && ai < 63) act[ai++] = *p++;
+        act[ai] = '\0';
+
+        if (!key[0] || !act[0]) {
+            config_report("terminator: %s:%d: malformed binding\n", path, lineno);
+            continue;
+        }
+
+        unsigned int mods = 0;
+        KeySym ks = parse_key_spec(key, &mods);
+        if (ks == NoSymbol) {
+            config_report("terminator: %s:%d: unknown key '%s', keeping default\n",
+                          path, lineno, key);
+            continue;
+        }
+        Action a = action_from_name(act);
+        if (a == ACT_NONE) {
+            config_report("terminator: %s:%d: unknown action '%s', keeping default\n",
+                          path, lineno, act);
+            continue;
+        }
+        if (np >= MAX_BINDINGS) continue;
+        pend[np].keysym = ks;
+        pend[np].mods   = mods & BIND_MODS;
+        pend[np].action = a;
+        pend[np].line   = lineno;
+        snprintf(pend[np].keystr, sizeof(pend[np].keystr), "%s", key);
+        np++;
+    }
+    fclose(f);
+
+    /* flag any key bound to two different actions by the file itself */
+    int bad[MAX_BINDINGS] = { 0 };
+    for (int i = 0; i < np; i++)
+        for (int j = i + 1; j < np; j++)
+            if (pend[i].keysym == pend[j].keysym && pend[i].mods == pend[j].mods &&
+                pend[i].action != pend[j].action)
+                bad[i] = bad[j] = 1;
+
+    for (int i = 0; i < np; i++) {
+        if (bad[i]) {
+            config_report("terminator: %s:%d: conflicting binding for '%s', "
+                          "keeping default\n", path, pend[i].line, pend[i].keystr);
+            continue;
+        }
+        set_binding(pend[i].keysym, pend[i].mods, pend[i].action, 1);
+    }
+}
+
+/* Persist the user's custom bindings back to ~/.terminatorrc. */
+static void rewrite_config(void) {
+    char path[1200];
+    if (config_path(path, sizeof(path)) < 0) return;
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    fprintf(f, "# ~/.terminatorrc - Terminator key bindings\n");
+    fprintf(f, "# syntax: bind <key> <action>\n");
+    fprintf(f, "# keys: Ctrl+/Shift+/Alt+ prefixes, e.g. Ctrl+Shift+C, Left, Up\n");
+    for (int i = 0; i < num_bindings; i++) {
+        if (!bindings[i].user) continue;
+        char kb[64];
+        format_key(bindings[i].keysym, bindings[i].mods, kb, sizeof(kb));
+        fprintf(f, "bind %s %s\n", kb, action_name(bindings[i].action));
+    }
+    fclose(f);
+}
+
+/* ===================================================================== */
 
 void append_output(Tab *tab, const char *str) {
     int len = strlen(str);
@@ -554,6 +869,13 @@ void init_tab(Tab *tab, int id) {
     update_tab_title(tab);
     tab->input_len = 0;
     tab->input_line[0] = '\0';
+    tab->cursor = 0;
+    tab->hist_pos = -1;
+    tab->hist_save[0] = '\0';
+    tab->sel_active = 0;
+    tab->sel_dragging = 0;
+    tab->sel_anchor_line = tab->sel_line = 0;
+    tab->sel_anchor_col  = tab->sel_col  = 0;
     tab->output_len = 0;
     tab->output_buffer[0] = '\0';
     tab->last_exit_status = 0;
@@ -649,6 +971,122 @@ void close_tab(int index) {
     }
 }
 
+/* ===================== line-editing actions ===================== */
+
+static int g_exit_requested = 0;
+
+static void history_prev(Tab *t) {
+    if (t->history_count == 0) return;
+    if (t->hist_pos == -1) {
+        snprintf(t->hist_save, sizeof(t->hist_save), "%s", t->input_line);
+        t->hist_pos = t->history_count - 1;
+    } else if (t->hist_pos > 0) {
+        t->hist_pos--;
+    } else {
+        return;
+    }
+    snprintf(t->input_line, sizeof(t->input_line), "%s", t->history[t->hist_pos]);
+    t->input_len = (int)strlen(t->input_line);
+    t->cursor = t->input_len;
+    t->sel_active = 0;
+}
+
+static void history_next(Tab *t) {
+    if (t->hist_pos == -1) return;
+    if (t->hist_pos < t->history_count - 1) {
+        t->hist_pos++;
+        snprintf(t->input_line, sizeof(t->input_line), "%s", t->history[t->hist_pos]);
+    } else {
+        t->hist_pos = -1;
+        snprintf(t->input_line, sizeof(t->input_line), "%s", t->hist_save);
+    }
+    t->input_len = (int)strlen(t->input_line);
+    t->cursor = t->input_len;
+    t->sel_active = 0;
+}
+
+/* delete from the cursor back to the start of the line (Ctrl+U) */
+static void kill_to_start(Tab *t) {
+    if (t->cursor <= 0) return;
+    memmove(t->input_line, t->input_line + t->cursor,
+            (size_t)(t->input_len - t->cursor + 1));
+    t->input_len -= t->cursor;
+    t->cursor = 0;
+    t->sel_active = 0;
+}
+
+/* delete from the cursor to the end of the line (Ctrl+K) */
+static void kill_to_end(Tab *t) {
+    t->input_line[t->cursor] = '\0';
+    t->input_len = t->cursor;
+    t->sel_active = 0;
+}
+
+/* delete the word before the cursor (Ctrl+W) */
+static void kill_word(Tab *t) {
+    int i = t->cursor;
+    while (i > 0 && isspace((unsigned char)t->input_line[i - 1])) i--;
+    while (i > 0 && !isspace((unsigned char)t->input_line[i - 1])) i--;
+    memmove(t->input_line + i, t->input_line + t->cursor,
+            (size_t)(t->input_len - t->cursor + 1));
+    t->input_len -= (t->cursor - i);
+    t->cursor = i;
+    t->sel_active = 0;
+}
+
+/* insert pasted text at the cursor (single-line: newlines become spaces) */
+static void insert_text(Tab *t, const char *data, int len) {
+    for (int i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)data[i];
+        if (c == '\n' || c == '\r') c = ' ';
+        if (c < 32) continue;
+        if (t->input_len >= MAX_LINE - 1) break;
+        memmove(t->input_line + t->cursor + 1, t->input_line + t->cursor,
+                (size_t)(t->input_len - t->cursor + 1));
+        t->input_line[t->cursor++] = (char)c;
+        t->input_len++;
+    }
+    t->sel_active = 0;
+}
+
+static void do_copy(Display *dpy, Window win, Tab *t);
+static void do_paste(Display *dpy, Window win, Tab *t);
+
+static int perform_action(Tab *t, Action a, Display *dpy, Window win) {
+    switch (a) {
+    case ACT_LEFT:          if (t->cursor > 0) t->cursor--; break;
+    case ACT_RIGHT:         if (t->cursor < t->input_len) t->cursor++; break;
+    case ACT_LINE_START:    t->cursor = 0; break;
+    case ACT_LINE_END:      t->cursor = t->input_len; break;
+    case ACT_HIST_UP:       history_prev(t); break;
+    case ACT_HIST_DOWN:     history_next(t); break;
+    case ACT_KILL_TO_START: kill_to_start(t); break;
+    case ACT_KILL_TO_END:   kill_to_end(t); break;
+    case ACT_KILL_WORD:     kill_word(t); break;
+    case ACT_CLEAR_SCREEN:
+        t->output_len = 0;
+        t->output_buffer[0] = '\0';
+        t->scroll = 0;
+        break;
+    case ACT_EXIT:
+        if (t->input_len == 0) {
+            if (num_tabs > 1) close_tab(current_tab);
+            else              g_exit_requested = 1;
+        }
+        break;
+    case ACT_COPY:
+        do_copy(dpy, win, t);
+        break;
+    case ACT_PASTE:
+        do_paste(dpy, win, t);
+        return 0;                    /* repaint happens on SelectionNotify */
+    default:
+        break;
+    }
+    return 1;
+}
+
+/* ================================================================= */
 
 /* Returns 1 if the buffer needs more input (unclosed quote or trailing \),
  * 0 if complete. */
@@ -908,6 +1346,58 @@ static int start_multiwatch(Tab *tab, const char *line) {
     return 0;
 }
 
+/* `bind` built-in: list bindings or set one and persist it. */
+static void handle_bind(Tab *tab, char **args, int argc) {
+    if (argc == 1) {
+        append_output(tab, "Key bindings (* = custom):\n");
+        for (int i = 0; i < num_bindings; i++) {
+            char kb[64], line[160];
+            format_key(bindings[i].keysym, bindings[i].mods, kb, sizeof(kb));
+            snprintf(line, sizeof(line), "  %c %-16s %s\n",
+                     bindings[i].user ? '*' : ' ', kb,
+                     action_name(bindings[i].action));
+            append_output(tab, line);
+        }
+        append_output(tab, "Usage: bind <key> <action>  (e.g. bind Ctrl+Y clear-screen)\n");
+        tab->last_exit_status = 0;
+        return;
+    }
+    if (argc < 3) {
+        append_output(tab, "terminator: bind: usage: bind <key> <action>\n");
+        tab->last_exit_status = 1;
+        return;
+    }
+
+    unsigned int mods = 0;
+    KeySym ks = parse_key_spec(args[1], &mods);
+    if (ks == NoSymbol) {
+        char err[256];
+        snprintf(err, sizeof(err), "terminator: bind: unknown key '%s'\n", args[1]);
+        append_output(tab, err);
+        tab->last_exit_status = 1;
+        return;
+    }
+    Action a = action_from_name(args[2]);
+    if (a == ACT_NONE) {
+        char err[256];
+        snprintf(err, sizeof(err), "terminator: bind: unknown action '%s'\n", args[2]);
+        append_output(tab, err);
+        tab->last_exit_status = 1;
+        return;
+    }
+
+    set_binding(ks, mods, a, 1);
+    rewrite_config();
+
+    char kb[64], msg[256];
+    format_key(ks, mods, kb, sizeof(kb));
+    snprintf(msg, sizeof(msg),
+             "terminator: bound %s to %s (saved to ~/.terminatorrc)\n",
+             kb, action_name(a));
+    append_output(tab, msg);
+    tab->last_exit_status = 0;
+}
+
 void execute_command(Tab *tab) {
     if (tab->input_len == 0) return;
 
@@ -946,6 +1436,7 @@ void execute_command(Tab *tab) {
     if (argc == 0) {
         tab->input_len = 0;
         tab->input_line[0] = '\0';
+        tab->cursor = 0;
         return;
     }
 
@@ -977,6 +1468,8 @@ void execute_command(Tab *tab) {
         tab->last_exit_status = 0;
     } else if (strcmp(args[0], "multiWatch") == 0) {
         start_multiwatch(tab, tab->input_line);
+    } else if (strcmp(args[0], "bind") == 0) {
+        handle_bind(tab, args, argc);
     } else {
         char cmd_copy[MAX_OUTPUT];
             strncpy(cmd_copy, tab->input_line, sizeof(cmd_copy) - 1);
@@ -989,6 +1482,8 @@ void execute_command(Tab *tab) {
     tab->scroll = 0;
     tab->input_len = 0;
     tab->input_line[0] = '\0';
+    tab->cursor = 0;
+    tab->hist_pos = -1;
 }
 
 static int char_cols(void) {
@@ -1045,14 +1540,151 @@ static void clamp_scroll(Tab *t) {
     if (t->scroll < 0) t->scroll = 0;
 }
 
-static void draw_wrapped_range(const char *buf, int len, int cols,
+/* ===================== X11 selection: copy / paste =====================
+ * The copying program keeps the text and only hands it over when another
+ * program asks (SelectionRequest), driven through the X server.          */
+
+static char *clip_text = NULL;
+static int   clip_len  = 0;
+
+/* text of absolute wrapped-display-line `want` (0-based) */
+static int display_line_text(Tab *t, int cols, int want, char *out, int outsz) {
+    char line[MAX_LINE];
+    int i = 0, idx = 0;
+    while (next_display_line(t->output_buffer, t->output_len, &i, cols, line)) {
+        if (idx == want) { snprintf(out, outsz, "%s", line); return 1; }
+        idx++;
+    }
+    if (t->multiline && t->multiline_len > 0) {
+        i = 0;
+        while (next_display_line(t->multiline_buf, t->multiline_len, &i, cols, line)) {
+            if (idx == want) { snprintf(out, outsz, "%s", line); return 1; }
+            idx++;
+        }
+    }
+    return 0;
+}
+
+static void selection_ordered(Tab *t, int *l1, int *c1, int *l2, int *c2) {
+    int la = t->sel_anchor_line, ca = t->sel_anchor_col;
+    int lb = t->sel_line,        cb = t->sel_col;
+    if (la > lb || (la == lb && ca > cb)) {
+        int tmp;
+        tmp = la; la = lb; lb = tmp;
+        tmp = ca; ca = cb; cb = tmp;
+    }
+    *l1 = la; *c1 = ca; *l2 = lb; *c2 = cb;
+}
+
+static char *extract_selection(Tab *t, int *out_len) {
+    *out_len = 0;
+    if (!t->sel_active) return NULL;
+
+    int cols = char_cols();
+    int la, ca, lb, cb;
+    selection_ordered(t, &la, &ca, &lb, &cb);
+
+    size_t cap = 256, n = 0;
+    char *buf = malloc(cap);
+    if (!buf) return NULL;
+
+    for (int L = la; L <= lb; L++) {
+        char text[MAX_LINE];
+        if (!display_line_text(t, cols, L, text, sizeof(text))) break;
+        int len  = (int)strlen(text);
+        int from = (L == la) ? ca : 0;
+        int to   = (L == lb) ? cb : len;
+        if (from < 0) from = 0;
+        if (to > len) to = len;
+        if (to < from) to = from;
+
+        size_t need = (size_t)(to - from) + 2;
+        if (n + need > cap) {
+            cap = (n + need) * 2;
+            char *nb = realloc(buf, cap);
+            if (!nb) { free(buf); return NULL; }
+            buf = nb;
+        }
+        memcpy(buf + n, text + from, (size_t)(to - from));
+        n += (size_t)(to - from);
+        if (L < lb) buf[n++] = '\n';
+    }
+    buf[n] = '\0';
+    *out_len = (int)n;
+    return buf;
+}
+
+/* claim CLIPBOARD and remember the text for later SelectionRequests */
+static void do_copy(Display *dpy, Window win, Tab *t) {
+    int len = 0;
+    char *text = extract_selection(t, &len);
+    if (!text || len == 0) { free(text); return; }
+
+    if (clip_text) free(clip_text);
+    clip_text = text;
+    clip_len  = len;
+
+    XSetSelectionOwner(dpy, atom_clipboard, win, CurrentTime);
+    if (XGetSelectionOwner(dpy, atom_clipboard) != win)
+        append_output(t, "terminator: could not claim the CLIPBOARD selection\n");
+}
+
+/* ask the current owner for UTF-8 text (answer arrives as SelectionNotify) */
+static void do_paste(Display *dpy, Window win, Tab *t) {
+    (void)t;
+    if (XGetSelectionOwner(dpy, atom_clipboard) == None) return;
+    XConvertSelection(dpy, atom_clipboard, atom_utf8, atom_sel_data, win, CurrentTime);
+}
+
+/* map a mouse y / x to selection (display line, column) coordinates */
+static int y_to_display_line(Tab *t, int y) {
+    int cols = char_cols();
+    int rows = usable_rows();
+    clamp_scroll(t);
+    int total = tab_display_lines(t, cols);
+    int end = total - t->scroll;
+    if (end < 0) end = 0;
+    if (end > total) end = total;
+    int start = end - rows;
+    if (start < 0) start = 0;
+    int line = (y - TEXT_TOP) / LINE_H + start;
+    if (line > total - 1) line = total - 1;
+    if (line < 0) line = 0;
+    return line;
+}
+
+static int x_to_col(int x) {
+    int c = (x - PAD_X) / CHAR_W;
+    if (c < 0) c = 0;
+    if (c > MAX_LINE - 1) c = MAX_LINE - 1;
+    return c;
+}
+
+static void draw_wrapped_range(Tab *t, const char *buf, int len, int cols, int screen,
                                int *index, int start, int end,
                                int *y, Display *display, Window window, GC gc) {
     char line[MAX_LINE];
     int i = 0;
+    int la = 0, ca = 0, lb = 0, cb = 0;
+    if (t->sel_active) selection_ordered(t, &la, &ca, &lb, &cb);
+
     while (next_display_line(buf, len, &i, cols, line)) {
         if (*index >= start && *index < end) {
-            XDrawString(display, window, gc, PAD_X, *y, line, (int)strlen(line));
+            int n = (int)strlen(line);
+            if (t->sel_active && *index >= la && *index <= lb) {
+                int from = (*index == la) ? ca : 0;
+                int to   = (*index == lb) ? cb : n;
+                if (from < 0) from = 0;
+                if (to > n)   to = n;
+                if (to > from) {
+                    XSetForeground(display, gc, 0xADD8E6);
+                    XFillRectangle(display, window, gc,
+                                   PAD_X + from * CHAR_W, *y - 13,
+                                   (to - from) * CHAR_W, LINE_H - 2);
+                    XSetForeground(display, gc, BlackPixel(display, screen));
+                }
+            }
+            XDrawString(display, window, gc, PAD_X, *y, line, n);
             *y += LINE_H;
         }
         (*index)++;
@@ -1118,30 +1750,28 @@ void redraw(Display *display, Window window, GC gc, int screen) {
 
     int text_y = TEXT_TOP;
     int index = 0;
-    draw_wrapped_range(t->output_buffer, t->output_len, cols,
+    draw_wrapped_range(t, t->output_buffer, t->output_len, cols, screen,
                        &index, start, end, &text_y, display, window, gc);
     if (t->multiline && t->multiline_len > 0)
-        draw_wrapped_range(t->multiline_buf, t->multiline_len, cols,
+        draw_wrapped_range(t, t->multiline_buf, t->multiline_len, cols, screen,
                            &index, start, end, &text_y, display, window, gc);
-                           draw_wrapped_range(t->output_buffer, t->output_len, cols,
-                                              &index, start, end, &text_y, display, window, gc);
-                           if (t->multiline && t->multiline_len > 0)
-                               draw_wrapped_range(t->multiline_buf, t->multiline_len, cols,
-                                                  &index, start, end, &text_y, display, window, gc);
-                       
-                           /* Prompt: only shown when following the latest output (scroll == 0).
-                            * Drawn right after the last output line, like a real terminal. */
-                           if (t->scroll == 0) {
-                               char current_prompt[MAX_LINE + 64];
-                               const char *prompt = t->multiline ? "> " : "user@terminator> ";
-                               snprintf(current_prompt, sizeof(current_prompt), "%s%s", prompt, t->input_line);
-                       
-                               /* Don't draw past the bottom of the window */
-                               if (text_y <= win_h - 4) {
-                                   XDrawString(display, window, gc, PAD_X, text_y,
-                                               current_prompt, (int)strlen(current_prompt));
-                               }
-                           }
+
+    /* Prompt: only shown when following the latest output (scroll == 0).
+     * Drawn right after the last output line, like a real terminal. */
+    if (t->scroll == 0) {
+        const char *prompt = t->multiline ? "> " : "user@terminator> ";
+        int plen = (int)strlen(prompt);
+
+        /* Don't draw past the bottom of the window */
+        if (text_y <= win_h - 4) {
+            XDrawString(display, window, gc, PAD_X, text_y, prompt, plen);
+            XDrawString(display, window, gc, PAD_X + plen * CHAR_W, text_y,
+                        t->input_line, t->input_len);
+            /* caret */
+            int cxp = PAD_X + (plen + t->cursor) * CHAR_W;
+            XFillRectangle(display, window, gc, cxp, text_y - 13, 2, 15);
+        }
+    }
 
     XFlush(display);
 }
@@ -1164,17 +1794,26 @@ int main(void) {
     );
 
     Atom delete_window = XInternAtom(display, "WM_DELETE_WINDOW", False);
+    atom_clipboard = XInternAtom(display, "CLIPBOARD",   False);
+    atom_utf8      = XInternAtom(display, "UTF8_STRING", False);
+    atom_targets   = XInternAtom(display, "TARGETS",     False);
+    atom_sel_data  = XInternAtom(display, "TERMINATOR_SELECTION", False);
     XStoreName(display, window, "Terminator");
     XSetWMProtocols(display, window, &delete_window, 1);
-    XSelectInput(display, window, ExposureMask | StructureNotifyMask | KeyPressMask | ButtonPressMask);
+    XSelectInput(display, window, ExposureMask | StructureNotifyMask | KeyPressMask |
+                                 ButtonPressMask | ButtonReleaseMask | PointerMotionMask);
     XMapWindow(display, window);
      XFlush(display);  
 
     GC gc = XCreateGC(display, window, 0, NULL);
 
+    /* Load key bindings from ~/.terminatorrc (falls back to defaults) */
+    load_config();
+
     // Initialize first tab
     num_tabs = 1;
     init_tab(&tabs[0], 1);
+    if (config_msgs_len > 0) append_output(&tabs[0], config_msgs);
 
     int x11_fd = ConnectionNumber(display);
 
@@ -1246,6 +1885,13 @@ int main(void) {
                         t->scroll -= 3;
                         clamp_scroll(t);
                         redraw(display, window, gc, scr);
+                    } else if (event.xbutton.button == Button1 && event.xbutton.y >= TEXT_TOP) {
+                        /* begin a mouse text selection */
+                        t->sel_anchor_line = t->sel_line = y_to_display_line(t, event.xbutton.y);
+                        t->sel_anchor_col  = t->sel_col  = x_to_col(event.xbutton.x);
+                        t->sel_dragging = 1;
+                        t->sel_active   = 0;
+                        redraw(display, window, gc, scr);
                     } else if (event.xbutton.y < TABBAR_BOTTOM) {
                     int click_x = event.xbutton.x;
                     int x = 5;
@@ -1280,14 +1926,80 @@ int main(void) {
 
                     redraw(display, window, gc, scr);
                 }
+                } else if (event.type == ButtonRelease) {
+                    Tab *t = &tabs[current_tab];
+                    if (t->sel_dragging) {
+                        t->sel_dragging = 0;
+                        t->sel_active   = 1;
+                        redraw(display, window, gc, scr);
+                    }
+                } else if (event.type == MotionNotify) {
+                    Tab *t = &tabs[current_tab];
+                    if (t->sel_dragging) {
+                        t->sel_line    = y_to_display_line(t, event.xmotion.y);
+                        t->sel_col     = x_to_col(event.xmotion.x);
+                        t->sel_active  = 1;
+                        redraw(display, window, gc, scr);
+                    }
+                } else if (event.type == SelectionRequest) {
+                    /* another program wants our CLIPBOARD text */
+                    XSelectionRequestEvent *r = &event.xselectionrequest;
+                    XSelectionEvent ev;
+                    memset(&ev, 0, sizeof(ev));
+                    ev.type      = SelectionNotify;
+                    ev.display   = r->display;
+                    ev.requestor = r->requestor;
+                    ev.selection = r->selection;
+                    ev.target    = r->target;
+                    ev.time      = r->time;
+                    ev.property  = None;
+                    if (r->property == None) r->property = r->target;
+
+                    if (r->target == atom_targets) {
+                        Atom avail[2] = { atom_utf8, XA_STRING };
+                        XChangeProperty(display, r->requestor, r->property, XA_ATOM, 32,
+                                        PropModeReplace, (unsigned char *)avail, 2);
+                        ev.property = r->property;
+                    } else if ((r->target == atom_utf8 || r->target == XA_STRING) && clip_text) {
+                        XChangeProperty(display, r->requestor, r->property, r->target, 8,
+                                        PropModeReplace, (unsigned char *)clip_text, clip_len);
+                        ev.property = r->property;
+                    }
+                    XSendEvent(display, r->requestor, False, 0, (XEvent *)&ev);
+                    XFlush(display);
+                } else if (event.type == SelectionClear) {
+                    if (clip_text) { free(clip_text); clip_text = NULL; clip_len = 0; }
+                } else if (event.type == SelectionNotify) {
+                    /* answer to our paste request */
+                    if (event.xselection.property != None) {
+                        Atom type; int fmt; unsigned long nitems, after;
+                        unsigned char *data = NULL;
+                        if (XGetWindowProperty(display, window, atom_sel_data, 0, 1 << 20, True,
+                                               AnyPropertyType, &type, &fmt, &nitems, &after,
+                                               &data) == Success && data) {
+                            insert_text(&tabs[current_tab], (char *)data, (int)nitems);
+                            XFree(data);
+                            redraw(display, window, gc, scr);
+                        }
+                    }
                 } else if (event.type == KeyPress) {
                     char buf[32];
                     KeySym keysym;
                     int len = XLookupString(&event.xkey, buf, sizeof(buf), &keysym, NULL);
 
                     Tab *t = &tabs[current_tab];
+                    unsigned int state = event.xkey.state;
 
-                    Bool ctrl = (event.xkey.state & ControlMask) != 0;
+                    /* configurable bindings take priority */
+                    int bi = find_binding(keysym, state & BIND_MODS);
+                    if (bi >= 0) {
+                        if (perform_action(t, bindings[bi].action, display, window))
+                            redraw(display, window, gc, scr);
+                        if (g_exit_requested) goto cleanup;
+                        continue;
+                    }
+
+                    Bool ctrl = (state & ControlMask) != 0;
 
                     if (ctrl && (keysym == XK_c || keysym == XK_C)) {
                         if (t->watching) {
@@ -1298,16 +2010,11 @@ int main(void) {
                         } else {
                             t->input_len = 0;
                             t->input_line[0] = '\0';
+                            t->cursor = 0;
                             append_output(t, "^C\n");
                         }
                         redraw(display, window, gc, scr);
                         continue;
-                    }
-
-                    if (ctrl && (keysym == XK_w || keysym == XK_W)) {
-                        close_tab(current_tab);
-                        redraw(display, window, gc, scr);
-                        continue;   // inside while(XPending) — skip normal handling
                     }
 
                     if (ctrl && (keysym == XK_t || keysym == XK_T)) {
@@ -1326,12 +2033,6 @@ int main(void) {
                         clamp_scroll(t);
                     } else if (keysym == XK_Next || keysym == XK_Page_Down) {
                         t->scroll -= usable_rows() - 1;
-                        clamp_scroll(t);
-                    } else if (keysym == XK_Up) {
-                        t->scroll += 1;
-                        clamp_scroll(t);
-                    } else if (keysym == XK_Down) {
-                        t->scroll -= 1;
                         clamp_scroll(t);
                     } else if (keysym == XK_Home) {
                         t->scroll = 1000000;
@@ -1365,6 +2066,7 @@ int main(void) {
                                 t->multiline = 1;
                                 t->input_len = 0;
                                 t->input_line[0] = '\0';
+                                t->cursor = 0;
                             } else {
                                 /* complete: run the full accumulated command */
                                 t->multiline = 0;
@@ -1385,19 +2087,28 @@ int main(void) {
                                 t->multiline_buf[0] = '\0';
                                 t->input_len = 0;
                                 t->input_line[0] = '\0';
+                                t->cursor = 0;
                             }
                         } else if (keysym == XK_BackSpace) {
-                        if (t->input_len > 0) {
+                        if (t->cursor > 0) {
+                            memmove(t->input_line + t->cursor - 1,
+                                    t->input_line + t->cursor,
+                                    (size_t)(t->input_len - t->cursor + 1));
+                            t->cursor--;
                             t->input_len--;
-                            t->input_line[t->input_len] = '\0';
+                            t->sel_active = 0;
                         }
                     } else if (keysym == XK_Tab) {
                         // Switch tab with Tab key
                         current_tab = (current_tab + 1) % num_tabs;
                     } else if (len > 0 && buf[0] >= 32 && buf[0] < 127) {
                         if (t->input_len < MAX_LINE - 1) {
-                            t->input_line[t->input_len++] = buf[0];
-                            t->input_line[t->input_len] = '\0';
+                            memmove(t->input_line + t->cursor + 1,
+                                    t->input_line + t->cursor,
+                                    (size_t)(t->input_len - t->cursor + 1));
+                            t->input_line[t->cursor++] = buf[0];
+                            t->input_len++;
+                            t->sel_active = 0;
                         }
                     }
                     redraw(display, window, gc, scr);
