@@ -85,6 +85,12 @@ typedef struct {
     int sel_anchor_line, sel_anchor_col;
     int sel_line, sel_col;
 
+    /* keyboard (Shift+arrows) selection over the input line, in character
+     * offsets: anchor is where it started, end is the moving edge. */
+    int in_sel_active;
+    int in_sel_anchor;
+    int in_sel_end;
+
     int watching;
     int nwatch;
     WatchCmd watches[MAX_WATCH];
@@ -878,6 +884,9 @@ void init_tab(Tab *tab, int id) {
     tab->sel_dragging = 0;
     tab->sel_anchor_line = tab->sel_line = 0;
     tab->sel_anchor_col  = tab->sel_col  = 0;
+    tab->in_sel_active = 0;
+    tab->in_sel_anchor = 0;
+    tab->in_sel_end    = 0;
     tab->output_len = 0;
     tab->output_buffer[0] = '\0';
     tab->last_exit_status = 0;
@@ -1055,6 +1064,9 @@ static void do_copy(Display *dpy, Window win, Tab *t);
 static void do_paste(Display *dpy, Window win, Tab *t);
 
 static int perform_action(Tab *t, Action a, Display *dpy, Window win) {
+    /* Any action other than copy ends a keyboard selection: only
+     * Shift+arrows (which never reach here) keep it alive. */
+    if (a != ACT_COPY) t->in_sel_active = 0;
     switch (a) {
     case ACT_LEFT:          if (t->cursor > 0) t->cursor--; break;
     case ACT_RIGHT:         if (t->cursor < t->input_len) t->cursor++; break;
@@ -1619,7 +1631,25 @@ static char *extract_selection(Tab *t, int *out_len) {
 /* claim CLIPBOARD and remember the text for later SelectionRequests */
 static void do_copy(Display *dpy, Window win, Tab *t) {
     int len = 0;
-    char *text = extract_selection(t, &len);
+    char *text = NULL;
+
+    /* a Shift+arrow selection over the input line takes priority */
+    if (t->in_sel_active) {
+        int a = t->in_sel_anchor, b = t->in_sel_end;
+        if (a > b) { int tmp = a; a = b; b = tmp; }
+        int ilen = (int)strlen(t->input_line);
+        if (a < 0)    a = 0;
+        if (b > ilen) b = ilen;
+        if (b > a) {
+            len = b - a;
+            text = malloc((size_t)len + 1);
+            if (text) { memcpy(text, t->input_line + a, (size_t)len); text[len] = '\0'; }
+        }
+    }
+    /* otherwise fall back to the mouse/output selection */
+    if (!text)
+        text = extract_selection(t, &len);
+
     if (!text || len == 0) { free(text); return; }
 
     if (clip_text) free(clip_text);
@@ -1673,23 +1703,133 @@ static void draw_wrapped_range(Tab *t, const char *buf, int len, int cols, int s
     while (next_display_line(buf, len, &i, cols, line)) {
         if (*index >= start && *index < end) {
             int n = (int)strlen(line);
+
+            /* Selected span of this display line, if any. */
+            int from = -1, to = -1;
             if (t->sel_active && *index >= la && *index <= lb) {
-                int from = (*index == la) ? ca : 0;
-                int to   = (*index == lb) ? cb : n;
+                from = (*index == la) ? ca : 0;
+                to   = (*index == lb) ? cb : n;
                 if (from < 0) from = 0;
                 if (to > n)   to = n;
-                if (to > from) {
-                    XSetForeground(display, gc, 0xADD8E6);
-                    XFillRectangle(display, window, gc,
-                                   PAD_X + from * CHAR_W, *y - 13,
-                                   (to - from) * CHAR_W, LINE_H - 2);
-                    XSetForeground(display, gc, BlackPixel(display, screen));
-                }
+                if (to <= from) { from = -1; to = -1; }
             }
-            XDrawString(display, window, gc, PAD_X, *y, line, n);
+
+            if (from >= 0) {
+                /* 1. Highlight background: a solid black block behind the text. */
+                XSetForeground(display, gc, BlackPixel(display, screen));
+                XFillRectangle(display, window, gc,
+                               PAD_X + from * CHAR_W, *y - 13,
+                               (to - from) * CHAR_W, LINE_H - 2);
+
+                /* 2. Draw text in layers: black, then the selected part in
+                 *    white over the block, then black again - inverse video. */
+                if (from > 0) {
+                    XSetForeground(display, gc, BlackPixel(display, screen));
+                    XDrawString(display, window, gc, PAD_X, *y, line, from);
+                }
+                XSetForeground(display, gc, WhitePixel(display, screen));
+                XDrawString(display, window, gc, PAD_X + from * CHAR_W, *y,
+                            line + from, to - from);
+                if (to < n) {
+                    XSetForeground(display, gc, BlackPixel(display, screen));
+                    XDrawString(display, window, gc, PAD_X + to * CHAR_W, *y,
+                                line + to, n - to);
+                }
+            } else {
+                XSetForeground(display, gc, BlackPixel(display, screen));
+                XDrawString(display, window, gc, PAD_X, *y, line, n);
+            }
             *y += LINE_H;
         }
         (*index)++;
+    }
+}
+
+/* Draw the prompt and the input line, wrapping long input onto extra
+ * display lines, plus the caret and any keyboard (Shift+arrow) selection. */
+static void draw_input(Tab *t, Display *display, Window window, GC gc, int screen,
+                       const char *prompt, int plen, int cols, int y0) {
+    const char *s = t->input_line;
+    int ilen = (int)strlen(s);
+    int icur = t->cursor;
+    if (icur < 0)    icur = 0;
+    if (icur > ilen) icur = ilen;
+
+    /* keyboard selection, clamped to the real input length */
+    int hl_from = -1, hl_to = -1;
+    if (t->in_sel_active) {
+        hl_from = t->in_sel_anchor;
+        hl_to   = t->in_sel_end;
+        if (hl_from > hl_to) { int tmp = hl_from; hl_from = hl_to; hl_to = tmp; }
+        if (hl_from < 0)  hl_from = 0;
+        if (hl_to > ilen) hl_to   = ilen;
+        if (hl_to <= hl_from) { hl_from = -1; hl_to = -1; }
+    }
+
+    /* caret: which display line and column it lands on */
+    int caret_line, caret_col;
+    {
+        int flow = plen + icur;
+        if (flow < cols) { caret_line = 0; caret_col = flow; }
+        else { int rem = flow - cols; caret_line = 1 + rem / cols; caret_col = rem % cols; }
+    }
+
+    int i = 0, first = 1, y = y0;
+    for (;;) {
+        int avail = cols - (first ? plen : 0);
+        if (avail < 1) avail = 1;
+        int seg_len = ilen - i;
+        if (seg_len > avail) seg_len = avail;
+        if (seg_len < 0) seg_len = 0;
+
+        int base_x = PAD_X + (first ? plen : 0) * CHAR_W;
+
+        XSetForeground(display, gc, BlackPixel(display, screen));
+        if (first)
+            XDrawString(display, window, gc, PAD_X, y, prompt, plen);
+
+        int sf = -1, st = -1;
+        if (hl_from >= 0 && seg_len > 0) {
+            sf = hl_from - i;
+            st = hl_to   - i;
+            if (sf < 0)       sf = 0;
+            if (st > seg_len) st = seg_len;
+            if (st <= sf) { sf = -1; st = -1; }
+        }
+
+        if (sf >= 0) {
+            /* black block + white selected text (inverse video) */
+            XSetForeground(display, gc, BlackPixel(display, screen));
+            XFillRectangle(display, window, gc,
+                           base_x + sf * CHAR_W, y - 13,
+                           (st - sf) * CHAR_W, LINE_H - 2);
+            if (sf > 0)
+                XDrawString(display, window, gc, base_x, y, s + i, sf);
+            XSetForeground(display, gc, WhitePixel(display, screen));
+            XDrawString(display, window, gc, base_x + sf * CHAR_W, y,
+                        s + i + sf, st - sf);
+            if (st < seg_len) {
+                XSetForeground(display, gc, BlackPixel(display, screen));
+                XDrawString(display, window, gc, base_x + st * CHAR_W, y,
+                            s + i + st, seg_len - st);
+            }
+        } else if (seg_len > 0) {
+            XDrawString(display, window, gc, base_x, y, s + i, seg_len);
+        }
+
+        i += seg_len;
+        first = 0;
+        y += LINE_H;
+        if (i >= ilen)     break;        /* whole input drawn */
+        if (y > win_h - 4) break;        /* no room for more lines */
+    }
+
+    /* caret last, so it sits on top of the text */
+    int caret_y = y0 + caret_line * LINE_H;
+    if (cursor_visible && caret_y <= win_h - 4) {
+        XSetForeground(display, gc, BlackPixel(display, screen));
+        int cxp = PAD_X + caret_col * CHAR_W;
+        XDrawLine(display, window, gc, cxp, caret_y - 12, cxp, caret_y + 2);
     }
 }
 
@@ -1760,34 +1900,11 @@ void redraw(Display *display, Window window, GC gc, int screen) {
 
     /* Prompt: only shown when following the latest output (scroll == 0).
      * Drawn right after the last output line, like a real terminal. */
-       if (t->scroll == 0) {
+    if (t->scroll == 0) {
         const char *prompt = t->multiline ? "> " : "user@terminator> ";
         int plen = (int)strlen(prompt);
-
-        /* Use the EXACT length of the string, not the tracked counter.
-         * This is what eliminates the stray trailing glyphs. */
-        int ilen = (int)strlen(t->input_line);
-        int icur = t->cursor;
-        if (icur < 0)      icur = 0;
-        if (icur > ilen)   icur = ilen;      /* clamp caret to real length */
-
-        /* Don't draw past the bottom of the window */
-        if (text_y <= win_h - 4) {
-            XDrawString(display, window, gc, PAD_X, text_y, prompt, plen);
-
-            /* draw exactly `ilen` bytes */
-            if (ilen > 0)
-                XDrawString(display, window, gc, PAD_X + plen * CHAR_W, text_y,
-                            t->input_line, ilen);
-
-            /* blink block cursor, placed right after the character at icur */
-            if (cursor_visible) {
-                int cxp = PAD_X + (plen + icur) * CHAR_W;
-                XDrawLine(display, window, gc,
-                               cxp, text_y - 12, cxp, text_y + 2);
-                
-            }
-        }
+        if (text_y <= win_h - 4)
+            draw_input(t, display, window, gc, screen, prompt, plen, cols, text_y);
     }
 
     XFlush(display);
@@ -2052,6 +2169,7 @@ int main(void) {
                             t->cursor = 0;
                             append_output(t, "^C\n");
                         }
+                        t->in_sel_active = 0;
                         redraw(display, window, gc, scr);
                         continue;
                     }
@@ -2062,6 +2180,28 @@ int main(void) {
                             current_tab = num_tabs;
                             num_tabs++;
                         }
+                        redraw(display, window, gc, scr);
+                        continue;
+                    }
+
+                    /* Shift + arrows: extend a keyboard selection over the
+                     * input line, highlighted like the mouse selection. */
+                    if ((state & ShiftMask) &&
+                        (keysym == XK_Left || keysym == XK_Right ||
+                         keysym == XK_Home || keysym == XK_End)) {
+                        int old = t->cursor;
+                        if      (keysym == XK_Left  && t->cursor > 0)            t->cursor--;
+                        else if (keysym == XK_Right && t->cursor < t->input_len) t->cursor++;
+                        else if (keysym == XK_Home)                             t->cursor = 0;
+                        else if (keysym == XK_End)                              t->cursor = t->input_len;
+
+                        if (!t->in_sel_active) {
+                            t->in_sel_active = 1;
+                            t->in_sel_anchor = old;
+                        }
+                        t->in_sel_end = t->cursor;
+                        if (t->in_sel_anchor == t->in_sel_end)
+                            t->in_sel_active = 0;
                         redraw(display, window, gc, scr);
                         continue;
                     }
@@ -2083,6 +2223,7 @@ int main(void) {
                                 redraw(display, window, gc, scr);
                                 continue;
                             }
+                            t->in_sel_active = 0;
 
                             if (t->multiline) {
                                 if (t->multiline_len + t->input_len + 2 < (int)sizeof(t->multiline_buf)) {
@@ -2129,7 +2270,17 @@ int main(void) {
                                 t->cursor = 0;
                             }
                         } else if (keysym == XK_BackSpace) {
-                        if (t->cursor > 0) {
+                        if (t->in_sel_active) {
+                            int a = t->in_sel_anchor, b = t->in_sel_end;
+                            if (a > b) { int tmp = a; a = b; b = tmp; }
+                            if (a < 0) a = 0;
+                            if (b > t->input_len) b = t->input_len;
+                            memmove(t->input_line + a, t->input_line + b,
+                                    (size_t)(t->input_len - b + 1));
+                            t->input_len -= (b - a);
+                            t->cursor = a;
+                            t->in_sel_active = 0;
+                        } else if (t->cursor > 0) {
                             memmove(t->input_line + t->cursor - 1,
                                     t->input_line + t->cursor,
                                     (size_t)(t->input_len - t->cursor + 1));
@@ -2141,6 +2292,18 @@ int main(void) {
                         // Switch tab with Tab key
                         current_tab = (current_tab + 1) % num_tabs;
                     } else if (len > 0 && buf[0] >= 32 && buf[0] < 127) {
+                        /* typed text replaces an active selection */
+                        if (t->in_sel_active) {
+                            int a = t->in_sel_anchor, b = t->in_sel_end;
+                            if (a > b) { int tmp = a; a = b; b = tmp; }
+                            if (a < 0) a = 0;
+                            if (b > t->input_len) b = t->input_len;
+                            memmove(t->input_line + a, t->input_line + b,
+                                    (size_t)(t->input_len - b + 1));
+                            t->input_len -= (b - a);
+                            t->cursor = a;
+                            t->in_sel_active = 0;
+                        }
                         if (t->input_len < MAX_LINE - 1) {
                             int ilen = (int)strlen(t->input_line);
                     memmove(t->input_line + t->cursor + 1, t->input_line + t->cursor,
