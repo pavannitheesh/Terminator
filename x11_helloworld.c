@@ -121,6 +121,15 @@ static int num_tabs = 0;
 static int current_tab = 0;
 static int win_w = 800, win_h = 500;
 
+/* ===================== shared command history =====================
+ * One history shared by every tab, kept in ~/.terminator_history like
+ * bash's ~/.bash_history.  The newest HISTORY_FILE_MAX commands are
+ * retained in memory; `history` prints the newest HISTORY_SHOW_MAX.  */
+static char g_history[HISTORY_FILE_MAX][MAX_LINE];
+static int  g_history_count = 0;   /* entries currently stored */
+static long g_history_base  = 0;   /* entries dropped off the front */
+static char g_history_path[1024];
+
 /* ===================== configurable key bindings =====================
  * A table of (modifiers, KeySym) -> action. Loaded from ~/.terminatorrc
  * at startup and editable at runtime with the `bind` built-in.          */
@@ -1029,7 +1038,7 @@ void init_tab(Tab *tab, int id) {
     tab->output_len = 0;
     tab->output_buffer[0] = '\0';
     tab->last_exit_status = 0;
-    tab->history_count = 0;
+    tab->search_mode = 0;
     tab->cur_job = -1;
     tab->fg_job  = -1;
     for (int i = 0; i < MAX_JOBS; i++) {
@@ -1138,17 +1147,139 @@ void close_tab(int index) {
 
 static int g_exit_requested = 0;
 
+/* --------------------- shared history storage --------------------- */
+
+static void history_path_init(void) {
+    const char *home = getenv("HOME");
+    if (!home || !*home) home = ".";
+    snprintf(g_history_path, sizeof(g_history_path), "%s/.terminator_history", home);
+}
+
+/* append one command to the in-memory history, dropping the oldest
+ * entry once HISTORY_FILE_MAX is reached */
+static void history_store(const char *cmd) {
+    if (!cmd || !*cmd) return;
+    if (g_history_count < HISTORY_FILE_MAX) {
+        snprintf(g_history[g_history_count], MAX_LINE, "%s", cmd);
+        g_history_count++;
+    } else {
+        memmove(g_history, g_history + 1,
+                sizeof(g_history[0]) * (HISTORY_FILE_MAX - 1));
+        snprintf(g_history[HISTORY_FILE_MAX - 1], MAX_LINE, "%s", cmd);
+        g_history_base++;
+    }
+}
+
+static void history_append_file(const char *cmd) {
+    if (!g_history_path[0]) history_path_init();
+    FILE *f = fopen(g_history_path, "a");
+    if (!f) return;
+    fprintf(f, "%s\n", cmd);
+    fclose(f);
+}
+
+/* rewrite the file so it holds exactly the in-memory history */
+static void history_save_file(void) {
+    if (!g_history_path[0]) history_path_init();
+    FILE *f = fopen(g_history_path, "w");
+    if (!f) return;
+    for (int i = 0; i < g_history_count; i++)
+        fprintf(f, "%s\n", g_history[i]);
+    fclose(f);
+}
+
+/* read ~/.terminator_history at startup; trim it back to the cap */
+static void history_load(void) {
+    history_path_init();
+    FILE *f = fopen(g_history_path, "r");
+    if (!f) return;
+    char line[MAX_LINE];
+    int  read = 0;
+    while (fgets(line, sizeof(line), f)) {
+        size_t n = strlen(line);
+        while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r'))
+            line[--n] = '\0';
+        if (n == 0) continue;
+        history_store(line);
+        read++;
+    }
+    fclose(f);
+    if (read > HISTORY_FILE_MAX) history_save_file();   /* drop the oldest */
+}
+
+/* longest contiguous substring shared by a and b */
+static int longest_common_substr(const char *a, const char *b) {
+    int la = (int)strlen(a), lb = (int)strlen(b);
+    if (la == 0 || lb == 0) return 0;
+    int *prev = calloc((size_t)lb + 1, sizeof(int));
+    int *cur  = calloc((size_t)lb + 1, sizeof(int));
+    if (!prev || !cur) { free(prev); free(cur); return 0; }
+    int best = 0;
+    for (int i = 1; i <= la; i++) {
+        for (int j = 1; j <= lb; j++) {
+            if (a[i - 1] == b[j - 1]) {
+                cur[j] = prev[j - 1] + 1;
+                if (cur[j] > best) best = cur[j];
+            } else {
+                cur[j] = 0;
+            }
+        }
+        int *tmp = prev; prev = cur; cur = tmp;
+    }
+    free(prev); free(cur);
+    return best;
+}
+
+/* Ctrl+R search: exact match, else longest-common-substring (>2), else
+ * "No match".  Results are appended to the tab's output. */
+static void run_history_search(Tab *t) {
+    const char *term = t->input_line;
+    if (!*term) {
+        append_output(t, "No match for search term in history\n");
+        return;
+    }
+
+    /* (a) most recent command that exactly matches the term */
+    for (int i = g_history_count - 1; i >= 0; i--) {
+        if (strcmp(g_history[i], term) == 0) {
+            char buf[MAX_LINE + 2];
+            snprintf(buf, sizeof(buf), "%s\n", g_history[i]);
+            append_output(t, buf);
+            return;
+        }
+    }
+
+    /* (b) commands sharing the longest common substring with the term */
+    int best = 0;
+    for (int i = 0; i < g_history_count; i++) {
+        int l = longest_common_substr(term, g_history[i]);
+        if (l > best) best = l;
+    }
+    if (best > 2) {
+        for (int i = 0; i < g_history_count; i++) {
+            if (longest_common_substr(term, g_history[i]) == best) {
+                char buf[MAX_LINE + 2];
+                snprintf(buf, sizeof(buf), "%s\n", g_history[i]);
+                append_output(t, buf);
+            }
+        }
+        return;
+    }
+
+    append_output(t, "No match for search term in history\n");
+}
+
 static void history_prev(Tab *t) {
-    if (t->history_count == 0) return;
+    if (g_history_count == 0) return;
     if (t->hist_pos == -1) {
         snprintf(t->hist_save, sizeof(t->hist_save), "%s", t->input_line);
-        t->hist_pos = t->history_count - 1;
+        t->hist_pos = g_history_count - 1;
     } else if (t->hist_pos > 0) {
         t->hist_pos--;
     } else {
         return;
     }
-    snprintf(t->input_line, sizeof(t->input_line), "%s", t->history[t->hist_pos]);
+    snprintf(t->input_line, sizeof(t->input_line), "%s", g_history[t->hist_pos]);
     t->input_len = (int)strlen(t->input_line);
     t->cursor = t->input_len;
     t->sel_active = 0;
@@ -1156,9 +1287,9 @@ static void history_prev(Tab *t) {
 
 static void history_next(Tab *t) {
     if (t->hist_pos == -1) return;
-    if (t->hist_pos < t->history_count - 1) {
+    if (t->hist_pos < g_history_count - 1) {
         t->hist_pos++;
-        snprintf(t->input_line, sizeof(t->input_line), "%s", t->history[t->hist_pos]);
+        snprintf(t->input_line, sizeof(t->input_line), "%s", g_history[t->hist_pos]);
     } else {
         t->hist_pos = -1;
         snprintf(t->input_line, sizeof(t->input_line), "%s", t->hist_save);
@@ -1699,12 +1830,10 @@ static void builtin_source(Tab *t, const char *path) {
 void execute_command(Tab *tab) {
     if (tab->input_len == 0) return;
 
-    // Add to history
-    if (tab->history_count < HISTORY_MAX) {
-        strcpy(tab->history[tab->history_count++], tab->input_line);
-    } else {
-        memmove(tab->history, tab->history + 1, sizeof(tab->history[0]) * (HISTORY_MAX - 1));
-        strcpy(tab->history[HISTORY_MAX - 1], tab->input_line);
+    /* Record in the shared, file-backed history so every tab sees it. */
+    if (tab->input_line[0]) {
+        history_store(tab->input_line);
+        history_append_file(tab->input_line);
     }
 
     /* A trailing '&' starts the command as a background job. */
@@ -1773,9 +1902,14 @@ void execute_command(Tab *tab) {
             tab->last_exit_status = 1;
         }
     } else if (strcmp(args[0], "history") == 0) {
-        for (int i = 0; i < tab->history_count; i++) {
-            char hist_buf[MAX_LINE + 16];
-            snprintf(hist_buf, sizeof(hist_buf), " %2d  %s\n", i + 1, tab->history[i]);
+        /* most recent HISTORY_SHOW_MAX commands from the shared history */
+        int shown = g_history_count < HISTORY_SHOW_MAX ? g_history_count
+                                                       : HISTORY_SHOW_MAX;
+        int start = g_history_count - shown;
+        for (int i = g_history_count-1; i >=start; i--) {
+            char hist_buf[MAX_LINE + 24];
+            snprintf(hist_buf, sizeof(hist_buf), "%5ld  %s\n",
+                     g_history_base + i + 1, g_history[i]);
             append_output(tab, hist_buf);
         }
         tab->last_exit_status = 0;
@@ -2209,7 +2343,9 @@ void redraw(Display *display, Window window, GC gc, int screen) {
      * and no foreground job owns the terminal.  While a command runs the
      * prompt stays hidden, exactly like a real shell. */
     if (t->scroll == 0 && foreground_job(t) == NULL) {
-        const char *prompt = t->multiline ? "> " : "user@terminator> ";
+        const char *prompt = t->search_mode ? "Enter search term: "
+                           : t->multiline   ? "> "
+                                            : "user@terminator> ";
         int plen = (int)strlen(prompt);
         if (text_y <= win_h - 4)
             draw_input(t, display, window, gc, screen, prompt, plen, cols, text_y);
@@ -2258,6 +2394,9 @@ int main(void) {
 
     /* Load key bindings from ~/.terminatorrc (falls back to defaults) */
     load_config();
+
+    /* Load the shared command history from ~/.terminator_history */
+    history_load();
 
     // Initialize first tab
     num_tabs = 1;
@@ -2457,6 +2596,32 @@ int main(void) {
                     Tab *t = &tabs[current_tab];
                     unsigned int state = event.xkey.state;
 
+                    /* Ctrl+R term entry: Return runs the search, Escape
+                     * cancels; arrows are ignored so they cannot overwrite
+                     * the term.  Other keys fall through to line editing. */
+                    if (t->search_mode) {
+                        if (keysym == XK_Return || keysym == XK_KP_Enter) {
+                            run_history_search(t);
+                            t->search_mode = 0;
+                            t->input_len = 0;
+                            t->input_line[0] = '\0';
+                            t->cursor = 0;
+                            redraw(display, window, gc, scr);
+                            continue;
+                        }
+                        if (keysym == XK_Escape) {
+                            t->search_mode = 0;
+                            t->input_len = 0;
+                            t->input_line[0] = '\0';
+                            t->cursor = 0;
+                            redraw(display, window, gc, scr);
+                            continue;
+                        }
+                        if (keysym == XK_Up || keysym == XK_Down ||
+                            keysym == XK_Prior || keysym == XK_Next)
+                            continue;
+                    }
+
                     /* configurable bindings take priority */
                     int bi = find_binding(keysym, state & BIND_MODS);
                     if (bi >= 0) {
@@ -2508,6 +2673,21 @@ int main(void) {
                         }
                         t->in_sel_active = 0;
                         tab_reap_jobs(t);
+                        redraw(display, window, gc, scr);
+                        continue;
+                    }
+
+                    /* Ctrl+R: start a reverse history search.  The prompt
+                     * becomes "Enter search term: " until Enter/Escape. */
+                    if (ctrl && (keysym == XK_r || keysym == XK_R)) {
+                        if (!t->search_mode && foreground_job(t) == NULL) {
+                            t->search_mode = 1;
+                            t->in_sel_active = 0;
+                            t->input_len = 0;
+                            t->input_line[0] = '\0';
+                            t->cursor = 0;
+                            append_output(t, "user@terminator> (Ctrl+R)\n");
+                        }
                         redraw(display, window, gc, scr);
                         continue;
                     }
@@ -2699,6 +2879,7 @@ int main(void) {
     }
 
 cleanup:
+    history_save_file();
     XDestroyWindow(display, window);
     XCloseDisplay(display);
     return 0;
