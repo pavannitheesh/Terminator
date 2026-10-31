@@ -19,6 +19,9 @@
 #include <time.h>
 #include <sys/time.h>
 #include <errno.h>
+#include <dirent.h>
+#include <sys/stat.h>
+#include <limits.h>
 
 #define MAX_PIPELINE 16          /* max commands in one pipeline */
 #define MAX_ARGS     64          /* max argv per command */
@@ -44,6 +47,7 @@ static int cursor_visible = 1;
 #define MAX_OUTPUT (4096 * 16)
 #define HISTORY_FILE_MAX 10000  /* commands kept in the shared history file */
 #define HISTORY_SHOW_MAX 1000   /* how many `history` prints */
+#define MAX_MATCHES 64          /* max Tab-completion candidates */
 #define LINE_H 18
 #define CHAR_W 6
 #define PAD_X 10
@@ -84,6 +88,16 @@ typedef struct {
     int hist_pos;                   /* browse index, -1 when not browsing */
     char hist_save[MAX_LINE];       /* line saved when history browse starts */
     int  search_mode;               /* 1 = Ctrl+R term entry in progress */
+
+    /* Tab completion */
+    int  comp_mode;                     /* 1 = waiting for a digit to pick */
+    char comp_prefix[MAX_LINE];         /* directory part incl. trailing '/' */
+    char comp_names[MAX_MATCHES][MAX_LINE]; /* candidate basenames */
+    int  comp_isdir[MAX_MATCHES];
+    int  comp_count;
+    int  comp_start, comp_end;          /* span of the word in input_line */
+    char comp_list[MAX_OUTPUT];         /* numbered candidates, drawn below */
+    int  comp_list_len;
     char output_buffer[MAX_OUTPUT];
     int output_len;
     int last_exit_status;
@@ -1039,6 +1053,9 @@ void init_tab(Tab *tab, int id) {
     tab->output_buffer[0] = '\0';
     tab->last_exit_status = 0;
     tab->search_mode = 0;
+    tab->comp_mode = 0;
+    tab->comp_count = 0;
+    tab->comp_list_len = 0;
     tab->cur_job = -1;
     tab->fg_job  = -1;
     for (int i = 0; i < MAX_JOBS; i++) {
@@ -1267,6 +1284,160 @@ static void run_history_search(Tab *t) {
     }
 
     append_output(t, "No match for search term in history\n");
+}
+
+/* ===================== Tab completion ===================== */
+
+/* replace input_line[start,end) with `text` and put the caret after it */
+static void splice_word(Tab *t, int start, int end, const char *text) {
+    int tlen = (int)strlen(text);
+    int rest = t->input_len - end;
+    if (start < 0) start = 0;
+    if (end > t->input_len) end = t->input_len;
+    int room = MAX_LINE - 1 - start - rest;
+    if (room < 0) room = 0;
+    if (tlen > room) tlen = room;
+    memmove(t->input_line + start + tlen, t->input_line + end, (size_t)rest + 1);
+    memcpy(t->input_line + start, text, (size_t)tlen);
+    t->input_len = start + tlen + rest;
+    t->cursor = start + tlen;
+    t->input_line[t->input_len] = '\0';
+    t->hist_pos = -1;
+}
+
+static int comp_name_cmp(const void *a, const void *b) {
+    return strcmp((const char *)a, (const char *)b);
+}
+
+/* insert candidate `i` in place of the word being completed */
+static void comp_apply(Tab *t, int i) {
+    char text[MAX_LINE];
+    snprintf(text, sizeof(text), "%s%s%s", t->comp_prefix, t->comp_names[i],
+             t->comp_isdir[i] ? "/" : "");
+    splice_word(t, t->comp_start, t->comp_end, text);
+    t->comp_mode  = 0;
+    t->comp_count = 0;
+    t->in_sel_active = 0;
+}
+
+/* Tab pressed: complete the word before the cursor from the tab's cwd */
+static void do_completion(Tab *t) {
+    const char *s = t->input_line;
+    int cur = t->cursor;
+    if (cur < 0) cur = 0;
+    if (cur > t->input_len) cur = t->input_len;
+
+    /* the word ends at the cursor and starts after the previous blank */
+    int ws = cur;
+    while (ws > 0 && !isspace((unsigned char)s[ws - 1])) ws--;
+    int wlen = cur - ws;
+    if (wlen <= 0 || wlen >= MAX_LINE) return;   /* nothing to complete */
+
+    char word[MAX_LINE];
+    memcpy(word, s + ws, (size_t)wlen);
+    word[wlen] = '\0';
+
+    /* split "dir/part" into a typed directory prefix and the base name */
+    char prefix[MAX_LINE];
+    const char *base;
+    char *slash = strrchr(word, '/');
+    if (slash) {
+        int plen = (int)(slash - word) + 1;
+        memcpy(prefix, word, (size_t)plen);
+        prefix[plen] = '\0';
+        base = slash + 1;
+    } else {
+        prefix[0] = '\0';
+        base = word;
+    }
+
+    /* directory to scan: the tab's cwd, an absolute path or ~/... */
+    char dir[PATH_MAX];
+    if (prefix[0] == '\0') {
+        snprintf(dir, sizeof(dir), "%s", t->cwd);
+    } else if (prefix[0] == '~' && (prefix[1] == '\0' || prefix[1] == '/')) {
+        const char *home = getenv("HOME");
+        if (!home || !*home) home = ".";
+        snprintf(dir, sizeof(dir), "%s%s", home, prefix + 1);
+    } else if (prefix[0] == '/') {
+        snprintf(dir, sizeof(dir), "%s", prefix);
+    } else {
+        snprintf(dir, sizeof(dir), "%s/%s", t->cwd, prefix);
+    }
+    size_t dl = strlen(dir);
+    while (dl > 1 && dir[dl - 1] == '/') dir[--dl] = '\0';
+
+    DIR *dp = opendir(dir);
+    if (!dp) return;                     /* unreadable dir: do nothing */
+
+    int baselen     = (int)strlen(base);
+    int want_hidden = (baselen > 0 && base[0] == '.');
+    int count       = 0;
+
+    struct dirent *de;
+    while ((de = readdir(dp)) != NULL && count < MAX_MATCHES) {
+        const char *nm = de->d_name;
+        if (strcmp(nm, ".") == 0 || strcmp(nm, "..") == 0) continue;
+        if (!want_hidden && nm[0] == '.') continue;
+        if (strncmp(nm, base, (size_t)baselen) != 0) continue;
+        char full[PATH_MAX];
+        struct stat st;
+        snprintf(full, sizeof(full), "%s/%s", dir, nm);
+        snprintf(t->comp_names[count], MAX_LINE, "%s", nm);
+        t->comp_isdir[count] = (stat(full, &st) == 0 && S_ISDIR(st.st_mode));
+        count++;
+    }
+    closedir(dp);
+
+    if (count == 0) return;              /* no match: do nothing */
+
+    qsort(t->comp_names, (size_t)count, MAX_LINE, comp_name_cmp);
+    t->comp_count = count;
+    t->comp_start = ws;
+    t->comp_end   = cur;
+    snprintf(t->comp_prefix, sizeof(t->comp_prefix), "%s", prefix);
+
+    /* one match: complete it */
+    if (count == 1) {
+        comp_apply(t, 0);
+        return;
+    }
+
+    /* several matches: extend the word to their longest common prefix */
+    int lcp = 0;
+    while (t->comp_names[0][lcp] != '\0') {
+        int ok = 1;
+        for (int i = 1; i < count; i++)
+            if (t->comp_names[i][lcp] != t->comp_names[0][lcp]) { ok = 0; break; }
+        if (!ok) break;
+        lcp++;
+    }
+
+    if (lcp > baselen) {
+        char text[MAX_LINE];
+        snprintf(text, sizeof(text), "%s%.*s", t->comp_prefix, lcp, t->comp_names[0]);
+        splice_word(t, t->comp_start, t->comp_end, text);
+        t->comp_end = t->comp_start + (int)strlen(text);
+        /* if the extension now names a candidate exactly, we are done */
+        for (int i = 0; i < count; i++)
+            if ((int)strlen(t->comp_names[i]) == lcp) {
+                t->comp_mode = 0;
+                t->comp_count = 0;
+                t->in_sel_active = 0;
+                return;
+            }
+    }
+
+    /* still ambiguous: keep a numbered list to draw just below the input
+     * line and wait for a digit to pick. */
+    int n = 0, shown = count < 9 ? count : 9;
+    for (int i = 0; i < shown; i++)
+        n += snprintf(t->comp_list + n, sizeof(t->comp_list) - (size_t)n,
+                      "%s%d. %s%s", i ? " " : "", i + 1, t->comp_names[i],
+                      t->comp_isdir[i] ? "/" : "");
+    t->comp_list_len = n;
+    t->comp_mode = 1;
+    t->in_sel_active = 0;
 }
 
 static void history_prev(Tab *t) {
@@ -2274,6 +2445,24 @@ static void draw_input(Tab *t, Display *display, Window window, GC gc, int scree
     }
 }
 
+/* how many display lines draw_input() uses for prompt + input */
+static int input_lines_used(int plen, int ilen, int cols) {
+    int lines = 0, i = 0, first = 1;
+    for (;;) {
+        int avail = cols - (first ? plen : 0);
+        if (avail < 1) avail = 1;
+        int seg = ilen - i;
+        if (seg > avail) seg = avail;
+        if (seg < 0) seg = 0;
+        i += seg;
+        lines++;
+        first = 0;
+        if (i >= ilen) break;
+        if (lines > 200) break;      /* safety */
+    }
+    return lines;
+}
+
 void redraw(Display *display, Window window, GC gc, int screen) {
     XClearWindow(display, window);
 
@@ -2347,8 +2536,24 @@ void redraw(Display *display, Window window, GC gc, int screen) {
                            : t->multiline   ? "> "
                                             : "user@terminator> ";
         int plen = (int)strlen(prompt);
-        if (text_y <= win_h - 4)
+        if (text_y <= win_h - 4) {
             draw_input(t, display, window, gc, screen, prompt, plen, cols, text_y);
+
+            /* Tab-completion menu, drawn just below the input line */
+            if (t->comp_mode && t->comp_list_len > 0) {
+                int lines = input_lines_used(plen, (int)strlen(t->input_line), cols);
+                int ly = text_y + lines * LINE_H;
+                int max_lines = (win_h - 4 - ly) / LINE_H;
+                if (max_lines > 0) {
+                    int li = 0, saved_sel = t->sel_active;
+                    t->sel_active = 0;   /* output selection doesn't apply here */
+                    draw_wrapped_range(t, t->comp_list, t->comp_list_len, cols,
+                                       screen, &li, 0, max_lines, &ly,
+                                       display, window, gc);
+                    t->sel_active = saved_sel;
+                }
+            }
+        }
     }
 
     XFlush(display);
@@ -2622,6 +2827,24 @@ int main(void) {
                             continue;
                     }
 
+                    /* Tab-completion menu: a digit picks a candidate, any
+                     * other key cancels the menu and is handled normally. */
+                    if (t->comp_mode) {
+                        if (keysym >= XK_1 && keysym <= XK_9) {
+                            int pick = (int)(keysym - XK_1);
+                            if (pick < t->comp_count) {
+                                comp_apply(t, pick);
+                            } else {
+                                t->comp_mode = 0;
+                                t->comp_count = 0;
+                            }
+                            redraw(display, window, gc, scr);
+                            continue;
+                        }
+                        t->comp_mode = 0;
+                        t->comp_count = 0;
+                    }
+
                     /* configurable bindings take priority */
                     int bi = find_binding(keysym, state & BIND_MODS);
                     if (bi >= 0) {
@@ -2814,7 +3037,10 @@ int main(void) {
                             t->sel_active = 0;
                         }
                     } else if (keysym == XK_Tab) {
-                        // Switch tab with Tab key
+                        /* Tab completes the word before the cursor */
+                        do_completion(t);
+                    } else if (keysym == XK_ISO_Left_Tab) {
+                        /* Shift+Tab cycles tabs (Tab now completes) */
                         current_tab = (current_tab + 1) % num_tabs;
                     } else if (len > 0 && buf[0] >= 32 && buf[0] < 127) {
                         /* typed text replaces an active selection */
