@@ -23,6 +23,7 @@
 #define MAX_PIPELINE 16          /* max commands in one pipeline */
 #define MAX_ARGS     64          /* max argv per command */
 #define MAX_STORAGE  (MAX_LINE * 64)
+#define MAX_JOBS 32
 #define MAX_WATCH 16
 #define WATCH_INTERVAL 2
 #define WATCH_OUT 8192
@@ -41,7 +42,8 @@ static int cursor_visible = 1;
 #define MAX_TABS 5
 #define MAX_LINE 256
 #define MAX_OUTPUT (4096 * 16)
-#define HISTORY_MAX 50
+#define HISTORY_FILE_MAX 10000  /* commands kept in the shared history file */
+#define HISTORY_SHOW_MAX 1000   /* how many `history` prints */
 #define LINE_H 18
 #define CHAR_W 6
 #define PAD_X 10
@@ -58,6 +60,21 @@ typedef struct {
     int out_len;
 } WatchCmd;
 
+/* One managed command, i.e. a pipeline running in its own process group.
+ * `pgid` is the group we signal (Ctrl+C / Ctrl+Z / fg / bg) and `pid` is
+ * the last pipeline stage, whose exit ends the job. */
+typedef struct {
+    int   used;
+    pid_t pid;              /* last stage pid */
+    pid_t pgid;             /* process group id */
+    int   pipe_fd;          /* capture pipe read end (-1 when closed) */
+    char  cmd[MAX_LINE];    /* command line, for jobs/fg/bg messages */
+    int   nlive;            /* pipeline stages not yet exited */
+    int   stopped;          /* 1 = suspended (SIGTSTP/SIGSTOP) */
+    int   background;       /* 1 = started with '&' */
+    int   status;           /* exit status (or 128+signal) once done */
+} Job;
+
 typedef struct {
     char title[64];
     char cwd[1024];
@@ -66,13 +83,15 @@ typedef struct {
     int cursor;                     /* caret position within input_line */
     int hist_pos;                   /* browse index, -1 when not browsing */
     char hist_save[MAX_LINE];       /* line saved when history browse starts */
+    int  search_mode;               /* 1 = Ctrl+R term entry in progress */
     char output_buffer[MAX_OUTPUT];
     int output_len;
     int last_exit_status;
-    char history[HISTORY_MAX][MAX_LINE];
-    int history_count;
-    int pipe_fd;
-    pid_t pid;
+
+    /* job control */
+    Job jobs[MAX_JOBS];
+    int cur_job;                    /* slot of the '+' job, -1 if none */
+    int fg_job;                     /* slot of the foreground job, -1 if none */
 
 
     int  multiline;
@@ -689,46 +708,146 @@ static int expand_globs(char **argv, int argc,
     return 0;
 }
 
-/* Fork + exec a single command in the pipeline.
- *   prev_read  : read end of previous pipe (-1 for first stage)
- *   next_write : write end of next pipe (-1 for last stage)
- *   out_fd     : file redirect for stdout (-1 = use next_write / parent pipe)
- * Returns child pid, or -1 on error. */
- pid_t spawn_child(Tab *tab, Command *cmd,
-                         int prev_read, int next_write, int out_fd) {
-    pid_t pid = fork();
-    if (pid != 0) return pid;     /* parent or error */
+/* ===================== job control =====================
+ * Every command runs in its own process group.  Keys arrive as X11
+ * events, so Terminator itself delivers Ctrl+C / Ctrl+Z with kill(). */
 
-    /* --- child --- */
-    if (prev_read >= 0) {
-        dup2(prev_read, STDIN_FILENO);
-    } else if (cmd->in_file[0] == '\0' && tab->pipe_fd != -1) {
-        /* no pipe before us, but shell may already have an in_fd — handled by caller */
+static void job_free(Tab *t, int idx) {
+    t->jobs[idx].used = 0;
+    t->jobs[idx].pipe_fd = -1;
+    t->jobs[idx].cmd[0] = '\0';
+    if (t->fg_job == idx) t->fg_job = -1;
+    if (t->cur_job == idx) {
+        t->cur_job = -1;
+        for (int i = MAX_JOBS - 1; i >= 0; i--)
+            if (t->jobs[i].used) { t->cur_job = i; break; }
+    }
+}
+
+/* Allocate the lowest free job slot, or -1 when the table is full. */
+static int job_alloc(Tab *t) {
+    for (int i = 0; i < MAX_JOBS; i++) {
+        if (!t->jobs[i].used) {
+            memset(&t->jobs[i], 0, sizeof(Job));
+            t->jobs[i].used = 1;
+            t->jobs[i].pipe_fd = -1;
+            t->cur_job = i;
+            return i;
+        }
+    }
+    return -1;
+}
+
+static int job_count(Tab *t) {
+    int n = 0;
+    for (int i = 0; i < MAX_JOBS; i++) if (t->jobs[i].used) n++;
+    return n;
+}
+
+static Job *foreground_job(Tab *t) {
+    if (t->fg_job < 0 || !t->jobs[t->fg_job].used) return NULL;
+    return &t->jobs[t->fg_job];
+}
+
+/* Drain everything currently buffered on a job's capture pipe.
+ * The pipe is non-blocking, so this never stalls the GUI. */
+static int drain_job(Tab *t, Job *j) {
+    if (j->pipe_fd < 0) return 0;
+    char buf[256];
+    int got = 0;
+    for (;;) {
+        ssize_t n = read(j->pipe_fd, buf, sizeof(buf) - 1);
+        if (n > 0) {
+            buf[n] = '\0';
+            append_output(t, buf);
+            got = 1;
+            continue;
+        }
+        if (n < 0 && errno == EINTR) continue;
+        break;                          /* 0 = EOF, -1 = EAGAIN */
+    }
+    return got;
+}
+
+static void job_print_stopped(Tab *t, int idx, int current) {
+    char buf[MAX_LINE + 32];
+    snprintf(buf, sizeof(buf), "[%d]%c Stopped %s\n",
+             idx + 1, current ? '+' : ' ', t->jobs[idx].cmd);
+    append_output(t, buf);
+}
+
+static void job_print_done(Tab *t, int idx, int current) {
+    char buf[MAX_LINE + 32];
+    snprintf(buf, sizeof(buf), "[%d]%c Done %s\n",
+             idx + 1, current ? '+' : ' ', t->jobs[idx].cmd);
+    append_output(t, buf);
+}
+
+static void job_print_bg(Tab *t, int idx, const char *cmd) {
+    char buf[MAX_LINE + 32];
+    snprintf(buf, sizeof(buf), "[%d]%c %s &\n", idx + 1, '+', cmd);
+    append_output(t, buf);
+}
+
+/* Take every notification the kernel has for a job: stops, exits of
+ * bookkeeping stages, and the exit of the last stage (which ends it).
+ * With `wait_event` set, keep polling briefly for a state change — used
+ * right after SIGTSTP so the suspend is reported synchronously. */
+static void job_reap(Tab *t, int idx, int wait_event) {
+    Job *j = &t->jobs[idx];
+    int spins = 0;
+    for (;;) {
+        int status = 0;
+        pid_t r = waitpid(-j->pgid, &status, WNOHANG | WUNTRACED);
+        if (r == 0) {                   /* nothing to report (yet) */
+            if (!wait_event || spins++ >= 500) return;
+            usleep(2000);
+            continue;
+        }
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return;
+        }
+        if (WIFSTOPPED(status)) {
+            if (!j->stopped) {
+                j->stopped = 1;
+                if (t->fg_job == idx) t->fg_job = -1;
+                job_print_stopped(t, idx, t->cur_job == idx);
+            }
+            return;                     /* a stop is not the end of the job */
+        } else if (WIFEXITED(status) || WIFSIGNALED(status)) {
+            if (r == j->pid)
+                j->status = WIFEXITED(status) ? WEXITSTATUS(status)
+                                              : 128 + WTERMSIG(status);
+            if (--j->nlive <= 0) break; /* every stage has exited */
+        } else {
+            return;
+        }
     }
 
-    /* stdout: file redirect wins, else pipe to next stage */
-    if (out_fd >= 0) {
-        dup2(out_fd, STDOUT_FILENO);
-    } else if (next_write >= 0) {
-        dup2(next_write, STDOUT_FILENO);
-    }
+    drain_job(t, j);                    /* flush whatever is still buffered */
+    int was_fg = (t->fg_job == idx);
+    if (j->pipe_fd >= 0) { close(j->pipe_fd); j->pipe_fd = -1; }
+    t->last_exit_status = j->status;
+    if (!was_fg) job_print_done(t, idx, t->cur_job == idx);
+    job_free(t, idx);
+}
 
-    /* stderr always goes to the tab's pipe (via next_write or the
-     * caller-provided stderr_fd). */
-    if (next_write >= 0) dup2(next_write, STDERR_FILENO);
-
-    /* close every inherited pipe fd */
-    /* (caller passes them via globals, or we close a known range — see below) */
-
-    chdir(tab->cwd);
-    execvp(cmd->argv[0], cmd->argv);
-    fprintf(stderr, "terminator: %s: command not found\n", cmd->argv[0]);
-    _exit(127);
+/* Non-blocking sweep of every job in the tab. */
+static void tab_reap_jobs(Tab *t) {
+    for (int i = 0; i < MAX_JOBS; i++)
+        if (t->jobs[i].used) job_reap(t, i, 0);
 }
 
 /* Run a command line that may contain '|' pipelines and redirections.
+ * `background` routes the job to the background (see `cmd &`).
  * Returns exit status of the LAST command (or 1 on setup error). */
-static int execute_pipeline(Tab *tab, char *line) {
+static int execute_pipeline(Tab *tab, char *line, int background) {
+    /* Keep the command text for jobs/fg/bg messages before split_pipeline
+     * NUL-terminates the segments in place. */
+    char cmd_name[MAX_LINE];
+    snprintf(cmd_name, sizeof(cmd_name), "%s", line);
+
     /* 1) Split on '|' */
     char *segments[MAX_PIPELINE];
     int n = split_pipeline(line, segments, MAX_PIPELINE);
@@ -794,8 +913,10 @@ static int execute_pipeline(Tab *tab, char *line) {
     int capture[2];
     if (pipe(capture) < 0) { perror("pipe"); /* cleanup… */ return 1; }
 
-    /* 6) Fork every stage */
+    /* 6) Fork every stage, all sharing one process group so Ctrl+C,
+     * Ctrl+Z, fg and bg can signal the whole pipeline at once. */
     pid_t pids[MAX_PIPELINE];
+    pid_t pgid = 0;                     /* first stage's pid */
     for (int i = 0; i < n; i++) {
         int prev_read  = (i > 0)        ? pipes[i - 1][0] : -1;
         int next_write = (i < n - 1)    ? pipes[i][1]     : -1;
@@ -805,6 +926,7 @@ static int execute_pipeline(Tab *tab, char *line) {
 
         if (pid == 0) {
             /* ---- CHILD ---- */
+            setpgid(0, i == 0 ? 0 : pgid);
             if (in_fds[i] >= 0)         dup2(in_fds[i], STDIN_FILENO);
             else if (prev_read >= 0)    dup2(prev_read, STDIN_FILENO);
 
@@ -835,6 +957,8 @@ static int execute_pipeline(Tab *tab, char *line) {
             fprintf(stderr, "terminator: %s: command not found\n", cmds[i].argv[0]);
             _exit(127);
         }
+        if (i == 0) pgid = pid;
+        setpgid(pid, pgid);             /* also done here to close the race */
         pids[i] = pid;
     }
 
@@ -848,13 +972,28 @@ static int execute_pipeline(Tab *tab, char *line) {
         if (out_fds[i] >= 0) close(out_fds[i]);
     }
 
-    /* 8) Hand the capture read-end to the tab so the event loop drains it */
-    tab->pipe_fd = capture[0];
-    tab->pid     = pids[n - 1];   /* reaped by the loop */
+    int flags = fcntl(capture[0], F_GETFL, 0);
+    if (flags >= 0) fcntl(capture[0], F_SETFL, flags | O_NONBLOCK);
 
-    /* Reap all but the last; the last is reaped when capture hits EOF. */
-    for (int i = 0; i < n - 1; i++) {
-        waitpid(pids[i], NULL, 0);
+    /* 8) Register the job; the event loop drains it and reaps the group. */
+    int slot = job_alloc(tab);
+    if (slot < 0) {
+        append_output(tab, "terminator: too many jobs\n");
+        close(capture[0]);
+        return 1;
+    }
+    Job *j = &tab->jobs[slot];
+    j->pid        = pids[n - 1];
+    j->pgid       = pgid;
+    j->pipe_fd    = capture[0];
+    j->nlive      = n;
+    j->background = background;
+    snprintf(j->cmd, sizeof(j->cmd), "%s", cmd_name);
+
+    if (background) {
+        job_print_bg(tab, slot, j->cmd);
+    } else {
+        tab->fg_job = slot;
     }
 
     return 0;
@@ -891,8 +1030,12 @@ void init_tab(Tab *tab, int id) {
     tab->output_buffer[0] = '\0';
     tab->last_exit_status = 0;
     tab->history_count = 0;
-    tab->pipe_fd = -1;
-    tab->pid = 0;
+    tab->cur_job = -1;
+    tab->fg_job  = -1;
+    for (int i = 0; i < MAX_JOBS; i++) {
+        memset(&tab->jobs[i], 0, sizeof(Job));
+        tab->jobs[i].pipe_fd = -1;
+    }
 
     tab->multiline = 0;
     tab->multiline_len = 0;
@@ -937,15 +1080,22 @@ void close_tab(int index) {
     if (num_tabs <= 1) return;          // keep at least one tab
 
     Tab *t = &tabs[index];
-    if (t->pipe_fd != -1) {
-        close(t->pipe_fd);
-        t->pipe_fd = -1;
+
+    /* Kill and collect every job owned by this tab. */
+    for (int i = 0; i < MAX_JOBS; i++) {
+        Job *j = &t->jobs[i];
+        if (!j->used) continue;
+        if (j->pgid > 0) {
+            kill(-j->pgid, SIGCONT);        /* wake a stopped job so it can die */
+            kill(-j->pgid, SIGTERM);
+        }
+        if (j->pipe_fd >= 0) { close(j->pipe_fd); j->pipe_fd = -1; }
+        if (j->pid > 0) waitpid(j->pid, NULL, 0);
+        j->used = 0;
     }
-    if (t->pid > 0) {
-        kill(t->pid, SIGTERM);
-        waitpid(t->pid, NULL, 0);
-        t->pid = 0;
-    }
+    t->cur_job = -1;
+    t->fg_job  = -1;
+
     if (t->watching) {
         for (int i = 0; i < t->nwatch; i++) {
             WatchCmd *w = &t->watches[i];
@@ -967,8 +1117,10 @@ void close_tab(int index) {
 
     // 3) Wipe the now-vacated tail slot so no stale fd/pid/data remains.
     memset(&tabs[num_tabs - 1], 0, sizeof(Tab));
-    tabs[num_tabs - 1].pipe_fd = -1;
-    tabs[num_tabs - 1].pid     = 0;
+    for (int i = 0; i < MAX_JOBS; i++)
+        tabs[num_tabs - 1].jobs[i].pipe_fd = -1;
+    tabs[num_tabs - 1].cur_job = -1;
+    tabs[num_tabs - 1].fg_job  = -1;
 
     num_tabs--;
 
@@ -1334,7 +1486,7 @@ static int start_multiwatch(Tab *tab, const char *line) {
         append_output(tab, "terminator: multiWatch: already running (Ctrl+C to stop)\n");
         return -1;
     }
-    if (tab->pipe_fd != -1) {
+    if (foreground_job(tab) != NULL) {
         append_output(tab, "terminator: a command is already running in this tab\n");
         return -1;
     }
@@ -1412,6 +1564,138 @@ static void handle_bind(Tab *tab, char **args, int argc) {
     tab->last_exit_status = 0;
 }
 
+/* ===================== jobs / fg / bg / source ===================== */
+
+void execute_command(Tab *tab);
+
+/* Resolve a job spec: %n, %+, %-, or a command prefix.  An empty spec
+ * means "the current job".  Returns a slot index, or -1 if not found. */
+static int job_lookup(Tab *t, const char *spec) {
+    if (!spec || !*spec || strcmp(spec, "%") == 0 ||
+        strcmp(spec, "%+") == 0 || strcmp(spec, "+") == 0)
+        return t->cur_job;
+
+    const char *p = spec;
+    if (*p == '%') p++;
+
+    if (*p == '-') {
+        for (int i = MAX_JOBS - 1; i >= 0; i--)
+            if (t->jobs[i].used && i != t->cur_job) return i;
+        return -1;
+    }
+    if (isdigit((unsigned char)*p)) {
+        int n = atoi(p);
+        if (n >= 1 && n <= MAX_JOBS && t->jobs[n - 1].used) return n - 1;
+        return -1;
+    }
+    for (int i = 0; i < MAX_JOBS; i++)
+        if (t->jobs[i].used && strncmp(t->jobs[i].cmd, p, strlen(p)) == 0)
+            return i;
+    return -1;
+}
+
+static void builtin_jobs(Tab *t) {
+    for (int i = 0; i < MAX_JOBS; i++) {
+        Job *j = &t->jobs[i];
+        if (!j->used) continue;
+        char buf[MAX_LINE + 48];
+        snprintf(buf, sizeof(buf), "[%d]%c  %-8s %s%s\n",
+                 i + 1, (i == t->cur_job) ? '+' : ' ',
+                 j->stopped ? "Stopped" : "Running",
+                 j->cmd, (j->background && !j->stopped) ? " &" : "");
+        append_output(t, buf);
+    }
+    t->last_exit_status = 0;
+}
+
+static void builtin_bg(Tab *t, const char *spec) {
+    int idx = job_lookup(t, spec);
+    if (idx < 0) {
+        append_output(t, "bg: no such job\n");
+        t->last_exit_status = 1;
+        return;
+    }
+    Job *j = &t->jobs[idx];
+    if (j->stopped) {
+        j->stopped = 0;
+        kill(-j->pgid, SIGCONT);
+    }
+    j->background = 1;
+    if (t->fg_job == idx) t->fg_job = -1;
+    t->cur_job = idx;
+    job_print_bg(t, idx, j->cmd);
+    t->last_exit_status = 0;
+}
+
+static void builtin_fg(Tab *t, const char *spec) {
+    int idx = job_lookup(t, spec);
+    if (idx < 0) {
+        append_output(t, "fg: no such job\n");
+        t->last_exit_status = 1;
+        return;
+    }
+    Job *j = &t->jobs[idx];
+    j->background = 0;
+    t->cur_job = idx;
+    t->fg_job  = idx;
+
+    char buf[MAX_LINE + 8];
+    snprintf(buf, sizeof(buf), "%s\n", j->cmd);
+    append_output(t, buf);              /* echo the resumed command */
+
+    if (j->stopped) {
+        j->stopped = 0;
+        kill(-j->pgid, SIGCONT);
+    }
+}
+
+static int source_depth = 0;
+
+static void builtin_source(Tab *t, const char *path) {
+    if (!path) {
+        append_output(t, "source: filename argument required\n");
+        t->last_exit_status = 1;
+        return;
+    }
+    /* Copy the name: args[] points into storage that the nested
+     * execute_command() calls will overwrite. */
+    char name[MAX_LINE];
+    snprintf(name, sizeof(name), "%s", path);
+
+    if (source_depth > 8) {
+        append_output(t, "source: too many nested calls\n");
+        t->last_exit_status = 1;
+        return;
+    }
+    FILE *fp = fopen(name, "r");
+    if (!fp) {
+        char err[MAX_LINE + 64];
+        snprintf(err, sizeof(err),
+                 "terminator: source: %s: No such file or directory\n", name);
+        append_output(t, err);
+        t->last_exit_status = 1;
+        return;
+    }
+
+    source_depth++;
+    char line[MAX_LINE];
+    while (fgets(line, sizeof(line), fp)) {
+        char *s = line;
+        while (*s == ' ' || *s == '\t') s++;
+        if (*s == '\0' || *s == '\n' || *s == '#') continue;
+        int len = (int)strlen(s);
+        while (len > 0 && (s[len - 1] == '\n' || s[len - 1] == '\r'))
+            s[--len] = '\0';
+        snprintf(t->input_line, MAX_LINE, "%s", s);
+        t->input_len = (int)strlen(t->input_line);
+        t->cursor   = t->input_len;
+        execute_command(t);
+    }
+    fclose(fp);
+    source_depth--;
+    t->last_exit_status = 0;
+}
+
 void execute_command(Tab *tab) {
     if (tab->input_len == 0) return;
 
@@ -1421,6 +1705,21 @@ void execute_command(Tab *tab) {
     } else {
         memmove(tab->history, tab->history + 1, sizeof(tab->history[0]) * (HISTORY_MAX - 1));
         strcpy(tab->history[HISTORY_MAX - 1], tab->input_line);
+    }
+
+    /* A trailing '&' starts the command as a background job. */
+    int background = 0;
+    {
+        int e = (int)strlen(tab->input_line);
+        while (e > 0 && (tab->input_line[e-1] == ' ' || tab->input_line[e-1] == '\t')) e--;
+        if (e > 0 && tab->input_line[e-1] == '&' &&
+            (e == 1 || tab->input_line[e-2] != '&')) {
+            background = 1;
+            tab->input_line[--e] = '\0';
+            while (e > 0 && (tab->input_line[e-1] == ' ' || tab->input_line[e-1] == '\t'))
+                tab->input_line[--e] = '\0';
+            tab->input_len = e;
+        }
     }
 
     // Echo prompt and command
@@ -1484,12 +1783,20 @@ void execute_command(Tab *tab) {
         start_multiwatch(tab, tab->input_line);
     } else if (strcmp(args[0], "bind") == 0) {
         handle_bind(tab, args, argc);
+    } else if (strcmp(args[0], "jobs") == 0) {
+        builtin_jobs(tab);
+    } else if (strcmp(args[0], "fg") == 0) {
+        builtin_fg(tab, args[1]);
+    } else if (strcmp(args[0], "bg") == 0) {
+        builtin_bg(tab, args[1]);
+    } else if (strcmp(args[0], "source") == 0 || strcmp(args[0], ".") == 0) {
+        builtin_source(tab, args[1]);
     } else {
         char cmd_copy[MAX_OUTPUT];
             strncpy(cmd_copy, tab->input_line, sizeof(cmd_copy) - 1);
             cmd_copy[sizeof(cmd_copy) - 1] = '\0';
 
-            int status = execute_pipeline(tab, cmd_copy);
+            int status = execute_pipeline(tab, cmd_copy, background);
             if (status != 0) tab->last_exit_status = status;
     }
 
@@ -1898,9 +2205,10 @@ void redraw(Display *display, Window window, GC gc, int screen) {
         draw_wrapped_range(t, t->multiline_buf, t->multiline_len, cols, screen,
                            &index, start, end, &text_y, display, window, gc);
 
-    /* Prompt: only shown when following the latest output (scroll == 0).
-     * Drawn right after the last output line, like a real terminal. */
-    if (t->scroll == 0) {
+    /* Prompt: only shown when following the latest output (scroll == 0)
+     * and no foreground job owns the terminal.  While a command runs the
+     * prompt stays hidden, exactly like a real shell. */
+    if (t->scroll == 0 && foreground_job(t) == NULL) {
         const char *prompt = t->multiline ? "> " : "user@terminator> ";
         int plen = (int)strlen(prompt);
         if (text_y <= win_h - 4)
@@ -1964,11 +2272,14 @@ int main(void) {
         FD_SET(x11_fd, &rfds);
         int max_fd = x11_fd;
 
-        // Monitor pipe file descriptors for running processes across tabs
+        // Monitor job output pipes and multiWatch pipes across all tabs
         for (int i = 0; i < num_tabs; i++) {
-            if (tabs[i].pipe_fd != -1) {
-                FD_SET(tabs[i].pipe_fd, &rfds);
-                if (tabs[i].pipe_fd > max_fd) max_fd = tabs[i].pipe_fd;
+            for (int k = 0; k < MAX_JOBS; k++) {
+                int fd = tabs[i].jobs[k].pipe_fd;
+                if (tabs[i].jobs[k].used && fd >= 0) {
+                    FD_SET(fd, &rfds);
+                    if (fd > max_fd) max_fd = fd;
+                }
             }
             if (tabs[i].watching) {
                 for (int w = 0; w < tabs[i].nwatch; w++) {
@@ -2157,12 +2468,16 @@ int main(void) {
 
                     Bool ctrl = (state & ControlMask) != 0;
 
+                    /* Ctrl+C: interrupt the foreground job.  The signal is
+                     * sent by us, so Terminator itself never stops. */
                     if (ctrl && (keysym == XK_c || keysym == XK_C)) {
-                        if (t->watching) {
-                            stop_multiwatch(t, 1);
-                        } else if (t->pid > 0) {
-                            kill(t->pid, SIGINT);
+                        Job *j = foreground_job(t);
+                        if (j) {
+                            kill(-j->pgid, SIGINT);
+                            kill(-j->pgid, SIGCONT);
                             append_output(t, "^C\n");
+                        } else if (t->watching) {
+                            stop_multiwatch(t, 1);
                         } else {
                             t->input_len = 0;
                             t->input_line[0] = '\0';
@@ -2173,6 +2488,36 @@ int main(void) {
                         redraw(display, window, gc, scr);
                         continue;
                     }
+
+                    /* Ctrl+Z: suspend the foreground job and take back the
+                     * prompt; report it like a real shell. */
+                    if (ctrl && (keysym == XK_z || keysym == XK_Z)) {
+                        Job *j = foreground_job(t);
+                        if (j) {
+                            int idx = t->fg_job;
+                            kill(-j->pgid, SIGTSTP);
+                            append_output(t, "^Z\n");
+                            /* Block briefly so the suspend is reported now;
+                             * job_reap prints "[n]+ Stopped <cmd>" itself. */
+                            job_reap(t, idx, 1);
+                        } else {
+                            t->input_len = 0;
+                            t->input_line[0] = '\0';
+                            t->cursor = 0;
+                            append_output(t, "^Z\n");
+                        }
+                        t->in_sel_active = 0;
+                        tab_reap_jobs(t);
+                        redraw(display, window, gc, scr);
+                        continue;
+                    }
+
+                    /* While a foreground job owns the terminal, hide the
+                     * prompt and swallow every other keystroke: the shell
+                     * is "busy" until the job finishes or is suspended.
+                     * Only Ctrl+C / Ctrl+Z above reach the child. */
+                    if (foreground_job(t) != NULL)
+                        continue;
 
                     if (ctrl && (keysym == XK_t || keysym == XK_T)) {
                         if (num_tabs < MAX_TABS) {
@@ -2322,39 +2667,34 @@ int main(void) {
         for (int i = 0; i < num_tabs; i++)
             restart_due_watches(&tabs[i]);
 
-        // Check background pipes for child output
+        // Collect job output and reap finished/stopped jobs
         for (int i = 0; i < num_tabs; i++) {
-            if (tabs[i].watching) {
+            Tab *t = &tabs[i];
+            if (t->watching) {
                 int changed = 0;
-                for (int w = 0; w < tabs[i].nwatch; w++) {
-                    WatchCmd *wc = &tabs[i].watches[w];
+                for (int w = 0; w < t->nwatch; w++) {
+                    WatchCmd *wc = &t->watches[w];
                     if (wc->pipe_fd >= 0 && FD_ISSET(wc->pipe_fd, &rfds)) {
-                        if (drain_watch_cmd(&tabs[i], wc))
+                        if (drain_watch_cmd(t, wc))
                             changed = 1;
                     }
                 }
                 if (changed) redraw(display, window, gc, scr);
             }
-            if (tabs[i].pipe_fd != -1 && FD_ISSET(tabs[i].pipe_fd, &rfds)) {
-                char read_buf[256];
-                int n = read(tabs[i].pipe_fd, read_buf, sizeof(read_buf) - 1);
-                if (n > 0) {
-                    read_buf[n] = '\0';
-                    append_output(&tabs[i], read_buf);
-                } else {
-                    close(tabs[i].pipe_fd);
-                    tabs[i].pipe_fd = -1;
-                    int status;
-                    waitpid(tabs[i].pid, &status, 0);
-                    if (WIFEXITED(status)) {
-                        tabs[i].last_exit_status = WEXITSTATUS(status);
-                    } else {
-                        tabs[i].last_exit_status = 1;
-                    }
-                    tabs[i].pid = 0;
-                }
-                redraw(display, window, gc, scr);
+
+            int got_output = 0;
+            for (int k = 0; k < MAX_JOBS; k++) {
+                Job *j = &t->jobs[k];
+                if (!j->used || j->pipe_fd < 0) continue;
+                if (FD_ISSET(j->pipe_fd, &rfds) && drain_job(t, j))
+                    got_output = 1;
             }
+
+            int before = job_count(t);
+            tab_reap_jobs(t);
+            int after = job_count(t);
+            if (got_output || after != before)
+                redraw(display, window, gc, scr);
         }
     }
 
