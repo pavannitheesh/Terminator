@@ -6,7 +6,7 @@ bin-release/
 a.out
 # Other files and folders
 .settings/
-
+practice/
 # Executables
 *.swf
 *.air

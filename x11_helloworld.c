@@ -35,13 +35,15 @@ typedef struct {
      int   argc;     
 } Command;
 
+static int cursor_visible = 1;
+
 
 #define MAX_TABS 5
 #define MAX_LINE 256
 #define MAX_OUTPUT (4096 * 16)
 #define HISTORY_MAX 50
 #define LINE_H 18
-#define CHAR_W 7
+#define CHAR_W 6
 #define PAD_X 10
 #define TEXT_TOP 55
 #define TABBAR_BOTTOM 35
@@ -1758,22 +1760,44 @@ void redraw(Display *display, Window window, GC gc, int screen) {
 
     /* Prompt: only shown when following the latest output (scroll == 0).
      * Drawn right after the last output line, like a real terminal. */
-    if (t->scroll == 0) {
+       if (t->scroll == 0) {
         const char *prompt = t->multiline ? "> " : "user@terminator> ";
         int plen = (int)strlen(prompt);
+
+        /* Use the EXACT length of the string, not the tracked counter.
+         * This is what eliminates the stray trailing glyphs. */
+        int ilen = (int)strlen(t->input_line);
+        int icur = t->cursor;
+        if (icur < 0)      icur = 0;
+        if (icur > ilen)   icur = ilen;      /* clamp caret to real length */
 
         /* Don't draw past the bottom of the window */
         if (text_y <= win_h - 4) {
             XDrawString(display, window, gc, PAD_X, text_y, prompt, plen);
-            XDrawString(display, window, gc, PAD_X + plen * CHAR_W, text_y,
-                        t->input_line, t->input_len);
-            /* caret */
-            int cxp = PAD_X + (plen + t->cursor) * CHAR_W;
-            XFillRectangle(display, window, gc, cxp, text_y - 13, 2, 15);
+
+            /* draw exactly `ilen` bytes */
+            if (ilen > 0)
+                XDrawString(display, window, gc, PAD_X + plen * CHAR_W, text_y,
+                            t->input_line, ilen);
+
+            /* blink block cursor, placed right after the character at icur */
+            if (cursor_visible) {
+                int cxp = PAD_X + (plen + icur) * CHAR_W;
+                XDrawLine(display, window, gc,
+                               cxp, text_y - 12, cxp, text_y + 2);
+                
+            }
         }
     }
 
     XFlush(display);
+}
+
+static void sync_input(Tab *t) {
+    int ilen = (int)strlen(t->input_line);
+    t->input_len = ilen;
+    if (t->cursor < 0)    t->cursor = 0;
+    if (t->cursor > ilen) t->cursor = ilen;
 }
 
 int main(void) {
@@ -1840,7 +1864,9 @@ int main(void) {
             }
         }
 
-        struct timeval tv, *tvp = NULL;
+               struct timeval tv, *tvp = NULL;
+        int blink = 0;
+
         time_t deadline = next_watch_deadline();
         if (deadline != 0) {
             time_t now = time(NULL);
@@ -1849,13 +1875,24 @@ int main(void) {
             tv.tv_sec = wait_s;
             tv.tv_usec = 0;
             tvp = &tv;
+        } else {
+            /* no scheduled wake-up: poll every 500 ms for the caret blink */
+            tv.tv_sec  = 0;
+            tv.tv_usec = 500000;
+            tvp = &tv;
+            blink = 1;
         }
 
-        // Use select() to avoid busy-waiting (timeout wakes us to re-run watches)
         int retval = select(max_fd + 1, &rfds, NULL, NULL, tvp);
         if (retval < 0) {
             if (errno == EINTR) continue;
             break;
+        }
+
+        if (blink && retval == 0) {
+            /* timeout with no I/O: flip the caret and repaint */
+            cursor_visible = !cursor_visible;
+            redraw(display, window, gc, scr);
         }
 
         // Check X11 events
@@ -1970,6 +2007,7 @@ int main(void) {
                 } else if (event.type == SelectionClear) {
                     if (clip_text) { free(clip_text); clip_text = NULL; clip_len = 0; }
                 } else if (event.type == SelectionNotify) {
+                    cursor_visible = 1;
                     /* answer to our paste request */
                     if (event.xselection.property != None) {
                         Atom type; int fmt; unsigned long nitems, after;
@@ -1983,6 +2021,7 @@ int main(void) {
                         }
                     }
                 } else if (event.type == KeyPress) {
+                     cursor_visible = 1;
                     char buf[32];
                     KeySym keysym;
                     int len = XLookupString(&event.xkey, buf, sizeof(buf), &keysym, NULL);
@@ -2103,13 +2142,14 @@ int main(void) {
                         current_tab = (current_tab + 1) % num_tabs;
                     } else if (len > 0 && buf[0] >= 32 && buf[0] < 127) {
                         if (t->input_len < MAX_LINE - 1) {
-                            memmove(t->input_line + t->cursor + 1,
-                                    t->input_line + t->cursor,
-                                    (size_t)(t->input_len - t->cursor + 1));
+                            int ilen = (int)strlen(t->input_line);
+                    memmove(t->input_line + t->cursor + 1, t->input_line + t->cursor,
+                            (size_t)(ilen - t->cursor + 1));
                             t->input_line[t->cursor++] = buf[0];
                             t->input_len++;
                             t->sel_active = 0;
                         }
+                         sync_input(t);   
                     }
                     redraw(display, window, gc, scr);
                 }
