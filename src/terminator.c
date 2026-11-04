@@ -50,7 +50,6 @@ static int cursor_visible = 1;
 
 #define MAX_TABS 5
 #define MAX_LINE 4096
-#define MAX_INPUT MAX_LINE       /* longest line the user can type */
 #define MAX_OUTPUT (4096 * 16)
 #define HISTORY_FILE_MAX 10000  /* commands kept in the shared history file */
 #define HISTORY_SHOW_MAX 1000   /* how many `history` prints */
@@ -3754,6 +3753,7 @@ int main(int argc, char **argv) {
                         close_tab(hit_close);
                     } else if (hit_tab >= 0) {
                         current_tab = hit_tab;
+                        tabs[hit_tab].in_sel_active = 0;
                     } else if (num_tabs < MAX_TABS && click_x >= x && click_x <= x + 40) {
                         init_tab(&tabs[num_tabs], num_tabs + 1);
                         current_tab = num_tabs;

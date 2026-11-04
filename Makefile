@@ -3,7 +3,7 @@ CFLAGS  = -Wall -Wextra -O2 -pthread
 LDLIBS  = -lX11 -pthread
 TARGET  = terminator
 
-SRC = x11_helloworld.c
+SRC = src/terminator.c
 
 all: $(TARGET)
 
