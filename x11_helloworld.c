@@ -29,7 +29,9 @@
 
 #define MAX_PIPELINE 16          /* max commands in one pipeline */
 #define MAX_ARGS     64          /* max argv per command */
-#define MAX_STORAGE  (MAX_LINE * 64)
+/* Room for one command's argv strings (kept small so the per-pipeline
+ * array stays comfortably off the session thread's stack). */
+#define MAX_STORAGE  16384
 #define MAX_JOBS 32
 #define MAX_WATCH 16
 #define WATCH_INTERVAL 2
@@ -47,7 +49,8 @@ static int cursor_visible = 1;
 
 
 #define MAX_TABS 5
-#define MAX_LINE 256
+#define MAX_LINE 4096
+#define MAX_INPUT MAX_LINE       /* longest line the user can type */
 #define MAX_OUTPUT (4096 * 16)
 #define HISTORY_FILE_MAX 10000  /* commands kept in the shared history file */
 #define HISTORY_SHOW_MAX 1000   /* how many `history` prints */
@@ -648,12 +651,36 @@ static int shell_split(const char *line, char **args, int maxargs,
             while (line[i] && line[i] != '"') {
                 if (line[i] == '\\' && line[i+1]) {
                     char n = line[i+1];
-                    if (n == '"' || n == '\\' || n == '$' || n == '`') {
-                        if (ci < (int)sizeof(cur) - 1) cur[ci++] = n;
+                    char e = 0;
+                    /* Inside double quotes the shell resolves these
+                     * escapes, so `echo "l1\nl2"` prints two lines and a
+                     * backslash-newline keeps the newline (it ends the
+                     * argument's visual line but not the word). */
+                    switch (n) {
+                        case 'n':  e = '\n'; break;
+                        case 't':  e = '\t'; break;
+                        case 'r':  e = '\r'; break;
+                        case 'a':  e = '\a'; break;
+                        case 'b':  e = '\b'; break;
+                        case 'f':  e = '\f'; break;
+                        case 'v':  e = '\v'; break;
+                        case 'e':  e = 27;   break;
+                        case '\\': e = '\\'; break;
+                        case '"':  e = '"';  break;
+                        case '$':  e = '$';  break;
+                        case '`':  e = '`';  break;
+                        case '\n': e = '\n'; break;  /* \<newline> keeps it */
+                        default:   e = 0;    break;
+                    }
+                    if (e) {
+                        if (ci < (int)sizeof(cur) - 1) cur[ci++] = e;
                         i += 2;
                         continue;
                     }
-                    if (n == '\n') { i += 2; continue; } /* continuation */
+                    /* unknown escape: keep the backslash literally */
+                    if (ci < (int)sizeof(cur) - 1) cur[ci++] = line[i];
+                    i++;
+                    continue;
                 }
                 if (ci < (int)sizeof(cur) - 1) cur[ci++] = line[i];
                 i++;
@@ -1502,12 +1529,19 @@ static void run_history_search(Tab *t) {
 
 /* ===================== Tab completion ===================== */
 
-/* replace input_line[start,end) with `text` and put the caret after it */
+/* replace input_line[start,end) with `text` and put the caret after it.
+ * The text after `end` is preserved, so completing with the caret in the
+ * middle of the line keeps the rest of the line intact. */
 static void splice_word(Tab *t, int start, int end, const char *text) {
     int tlen = (int)strlen(text);
-    int rest = t->input_len - end;
-    if (start < 0) start = 0;
-    if (end > t->input_len) end = t->input_len;
+    /* trust the string, not the cached length, so a mid-line cursor can
+     * never make us drop the tail of the line */
+    int ilen = (int)strlen(t->input_line);
+    if (start < 0)      start = 0;
+    if (start > ilen)   start = ilen;
+    if (end < start)    end = start;
+    if (end > ilen)     end = ilen;
+    int rest = ilen - end;
     int room = MAX_LINE - 1 - start - rest;
     if (room < 0) room = 0;
     if (tlen > room) tlen = room;
@@ -1537,9 +1571,12 @@ static void comp_apply(Tab *t, int i) {
 /* Tab pressed: complete the word before the cursor from the tab's cwd */
 static void do_completion(Tab *t) {
     const char *s = t->input_line;
+    /* recompute from the string so the cached length can never be stale */
+    int ilen = (int)strlen(s);
+    t->input_len = ilen;
     int cur = t->cursor;
     if (cur < 0) cur = 0;
-    if (cur > t->input_len) cur = t->input_len;
+    if (cur > ilen) cur = ilen;
 
     /* the word ends at the cursor and starts after the previous blank */
     int ws = cur;
@@ -1782,7 +1819,7 @@ static int input_incomplete(const char *s, int len) {
     int real = len;
     if (real > 0 && s[real-1] == '\n') real--;
 
-    int i = 0, in_sq = 0, in_dq = 0;
+    int i = 0, in_sq = 0, in_dq = 0, par = 0, tick = 0;
     while (i < len) {
         char c = s[i];
 
@@ -1796,13 +1833,19 @@ static int input_incomplete(const char *s, int len) {
         }
         if (in_dq) {
             if (c == '"') in_dq = 0;
+            else if (c == '$' && s[i+1] == '(') { par++; i += 2; continue; }
+            else if (c == ')' && par > 0) par--;
+            else if (c == '`') tick = !tick;
             i++; continue;
         }
         if (c == '\'') { in_sq = 1; i++; continue; }
         if (c == '"')  { in_dq = 1; i++; continue; }
+        if (c == '$' && s[i+1] == '(') { par++; i += 2; continue; }
+        if (c == ')' && par > 0) par--;
+        else if (c == '`') tick = !tick;
         i++;
     }
-    if (in_sq || in_dq) return 1;
+    if (in_sq || in_dq || par > 0 || tick) return 1;
 
     /* trailing backslash (before the added \n) means continue */
     if (real > 0 && s[real-1] == '\\') return 1;
@@ -2209,6 +2252,214 @@ static void builtin_source(Tab *t, const char *path) {
     t->last_exit_status = 0;
 }
 
+/* ===================== expansion: $VAR, $(...), `...` =====================
+ * A light version of the shell's expansion pass.  It runs on the raw
+ * command line before it is split into a pipeline, so a substitution may
+ * itself contain pipes and newlines.
+ *
+ *   - single quotes are literal,
+ *   - double quotes still expand $VAR and command substitutions,
+ *   - $(...) and `...` run through /bin/sh in the tab's own directory and
+ *     their stdout replaces the text; because the body is expanded first,
+ *     the innermost substitution runs first.
+ */
+
+#define EXPAND_DEPTH_MAX 16
+
+static void ex_put(char *out, int *o, int outsz, char c) {
+    if (*o < outsz - 1) out[(*o)++] = c;
+}
+static void ex_puts(char *out, int *o, int outsz, const char *s, int n) {
+    for (int i = 0; i < n; i++) ex_put(out, o, outsz, s[i]);
+}
+
+/* Index of the ')' matching the '(' at open_idx, or -1. */
+static int match_paren(const char *s, int open_idx) {
+    int depth = 0, in_sq = 0, in_dq = 0;
+    for (int i = open_idx; s[i]; i++) {
+        char c = s[i];
+        if (in_sq) { if (c == '\'') in_sq = 0; continue; }
+        if (c == '\\' && s[i+1]) { i++; continue; }
+        if (in_dq) {
+            if (c == '"') in_dq = 0;
+            else if (c == '\\' && s[i+1]) i++;
+            continue;
+        }
+        if (c == '\'') { in_sq = 1; continue; }
+        if (c == '"')  { in_dq = 1; continue; }
+        if (c == '(') depth++;
+        else if (c == ')') { if (--depth == 0) return i; }
+    }
+    return -1;
+}
+
+/* Index of the backtick matching the one at open_idx, or -1. */
+static int match_backtick(const char *s, int open_idx) {
+    for (int i = open_idx + 1; s[i]; i++) {
+        if (s[i] == '\\' && s[i+1]) { i++; continue; }
+        if (s[i] == '`') return i;
+    }
+    return -1;
+}
+
+/* Run `cmd` through /bin/sh with the tab's cwd and capture its stdout.
+ * Trailing newlines are stripped, as every shell does. */
+static int capture_substitution(Tab *tab, const char *cmd, char *out, int outsz) {
+    out[0] = '\0';
+    int p[2];
+    if (pipe(p) < 0) return -1;
+
+    pid_t pid = fork();
+    if (pid < 0) { close(p[0]); close(p[1]); return -1; }
+    if (pid == 0) {
+        close(p[0]);
+        if (p[1] != STDOUT_FILENO) { dup2(p[1], STDOUT_FILENO); close(p[1]); }
+        if (tab && tab->cwd[0]) chdir(tab->cwd);
+        signal(SIGINT,  SIG_DFL);
+        signal(SIGQUIT, SIG_DFL);
+        signal(SIGTSTP, SIG_DFL);
+        execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
+        _exit(127);
+    }
+    close(p[1]);
+
+    int total = 0;
+    char buf[4096];
+    for (;;) {
+        ssize_t r = read(p[0], buf, sizeof(buf));
+        if (r > 0) {
+            int room = outsz - 1 - total;
+            if (room > 0) {
+                int cpy = (r < room) ? (int)r : room;
+                memcpy(out + total, buf, (size_t)cpy);
+                total += cpy;
+            }
+            continue;
+        }
+        if (r < 0 && errno == EINTR) continue;
+        break;
+    }
+    out[total] = '\0';
+    close(p[0]);
+
+    int st;
+    while (waitpid(pid, &st, 0) < 0 && errno == EINTR) { }
+
+    while (total > 0 && (out[total-1] == '\n' || out[total-1] == '\r'))
+        out[--total] = '\0';
+    return total;
+}
+
+static void expand_scan(Tab *tab, const char *s, char *out, int *o, int outsz, int depth);
+
+/* Substitute one $(...) / `...`: expand the body first (so the innermost
+ * substitution runs first), then run it through the shell. */
+static void expand_substitution(Tab *tab, const char *body, int blen,
+                                char *out, int *o, int outsz, int depth) {
+    char *raw      = malloc(MAX_OUTPUT);
+    char *expanded = malloc(MAX_OUTPUT);
+    char *sub      = malloc(MAX_OUTPUT);
+    if (!raw || !expanded || !sub) { free(raw); free(expanded); free(sub); return; }
+
+    int io = 0;
+    for (int i = 0; i < blen; i++) ex_put(raw, &io, MAX_OUTPUT, body[i]);
+    raw[io] = '\0';
+
+    int eo = 0;
+    expand_scan(tab, raw, expanded, &eo, MAX_OUTPUT, depth + 1);
+    expanded[eo] = '\0';
+
+    capture_substitution(tab, expanded, sub, MAX_OUTPUT);
+    ex_puts(out, o, outsz, sub, (int)strlen(sub));
+
+    free(raw); free(expanded); free(sub);
+}
+
+static void expand_scan(Tab *tab, const char *s, char *out, int *o, int outsz, int depth) {
+    int in_sq = 0, in_dq = 0;
+
+    for (int i = 0; s[i]; ) {
+        char c = s[i];
+
+        if (in_sq) {
+            ex_put(out, o, outsz, c);
+            if (c == '\'') in_sq = 0;
+            i++;
+            continue;
+        }
+        if (c == '\\' && s[i+1]) {
+            /* keep escapes for the quoting pass, which resolves them */
+            ex_put(out, o, outsz, c);
+            ex_put(out, o, outsz, s[i+1]);
+            i += 2;
+            continue;
+        }
+        if (c == '\'' && !in_dq) { in_sq = 1; ex_put(out, o, outsz, c); i++; continue; }
+        if (c == '"') { in_dq = !in_dq; ex_put(out, o, outsz, c); i++; continue; }
+
+        if (c == '$' && s[i+1] == '(' && depth < EXPAND_DEPTH_MAX) {
+            int close = match_paren(s, i + 1);
+            if (close < 0) { ex_put(out, o, outsz, c); i++; continue; }
+            expand_substitution(tab, s + i + 2, close - (i + 2), out, o, outsz, depth);
+            i = close + 1;
+            continue;
+        }
+        if (c == '`' && depth < EXPAND_DEPTH_MAX) {
+            int close = match_backtick(s, i);
+            if (close < 0) { ex_put(out, o, outsz, c); i++; continue; }
+            expand_substitution(tab, s + i + 1, close - (i + 1), out, o, outsz, depth);
+            i = close + 1;
+            continue;
+        }
+        if (c == '$') {
+            char num[32];
+            if (s[i+1] == '?') {
+                int n = snprintf(num, sizeof(num), "%d", tab ? tab->last_exit_status : 0);
+                ex_puts(out, o, outsz, num, n);
+                i += 2; continue;
+            }
+            if (s[i+1] == '$') {
+                int n = snprintf(num, sizeof(num), "%d", (int)getpid());
+                ex_puts(out, o, outsz, num, n);
+                i += 2; continue;
+            }
+            if (s[i+1] == '{') {
+                int j = i + 2;
+                char name[256]; int k = 0;
+                while (s[j] && s[j] != '}' && k < (int)sizeof(name) - 1) name[k++] = s[j++];
+                name[k] = '\0';
+                if (s[j] == '}') j++;
+                const char *v = getenv(name);
+                if (v) ex_puts(out, o, outsz, v, (int)strlen(v));
+                i = j; continue;
+            }
+            if (isalpha((unsigned char)s[i+1]) || s[i+1] == '_') {
+                int j = i + 1;
+                char name[256]; int k = 0;
+                while ((isalnum((unsigned char)s[j]) || s[j] == '_') &&
+                       k < (int)sizeof(name) - 1) name[k++] = s[j++];
+                name[k] = '\0';
+                const char *v = getenv(name);
+                if (v) ex_puts(out, o, outsz, v, (int)strlen(v));
+                i = j; continue;
+            }
+            ex_put(out, o, outsz, c);
+            i++;
+            continue;
+        }
+        ex_put(out, o, outsz, c);
+        i++;
+    }
+}
+
+/* Expand `src` into `out`; returns the number of bytes written. */
+static int expand_line(Tab *tab, const char *src, char *out, int outsz) {
+    int o = 0;
+    expand_scan(tab, src, out, &o, outsz, 0);
+    out[o] = '\0';
+    return o;
+}
+
 void execute_command(Tab *tab) {
     if (tab->input_len == 0) return;
 
@@ -2220,46 +2471,67 @@ void execute_command(Tab *tab) {
         history_unlock();
     }
 
-    /* A trailing '&' starts the command as a background job. */
-    int background = 0;
+    /* Echo the prompt and the command exactly as typed (multi-line aware). */
     {
-        int e = (int)strlen(tab->input_line);
-        while (e > 0 && (tab->input_line[e-1] == ' ' || tab->input_line[e-1] == '\t')) e--;
-        if (e > 0 && tab->input_line[e-1] == '&' &&
-            (e == 1 || tab->input_line[e-2] != '&')) {
-            background = 1;
-            tab->input_line[--e] = '\0';
-            while (e > 0 && (tab->input_line[e-1] == ' ' || tab->input_line[e-1] == '\t'))
-                tab->input_line[--e] = '\0';
-            tab->input_len = e;
+        char *echo = strdup(tab->input_line);
+        if (echo) {
+            int first = 1;
+            for (char *line = strtok(echo, "\n"); line;
+                 line = strtok(NULL, "\n")) {
+                char buf[MAX_LINE + 64];
+                snprintf(buf, sizeof(buf), "%s%s\n",
+                         first ? "user@terminator> " : "> ", line);
+                append_output(tab, buf);
+                first = 0;
+            }
+            free(echo);
         }
     }
 
-    // Echo prompt and command
-    char tmp[MAX_OUTPUT];
-        strncpy(tmp, tab->input_line, sizeof(tmp) - 1);
-        tmp[sizeof(tmp) - 1] = '\0';
+    /* Expand $VAR, ${VAR}, $?, $$, $(...) and `...` into a private copy.
+     * The raw line stays untouched for the echo above and the history. */
+    char *expanded = malloc(MAX_OUTPUT);
+    if (!expanded) {
+        append_output(tab, "terminator: out of memory\n");
+        tab->input_len = 0;
+        tab->input_line[0] = '\0';
+        tab->cursor = 0;
+        return;
+    }
+    expand_line(tab, tab->input_line, expanded, MAX_OUTPUT);
 
-        int first = 1;
-        char *line = strtok(tmp, "\n");
-        while (line) {
-            char buf[MAX_LINE + 64];
-            snprintf(buf, sizeof(buf), "%s%s\n",
-                     first ? "user@terminator> " : "> ", line);
-            append_output(tab, buf);
-            first = 0;
-            line = strtok(NULL, "\n");
+    /* A trailing '&' starts the command as a background job. */
+    int background = 0;
+    {
+        int e = (int)strlen(expanded);
+        while (e > 0 && (expanded[e-1] == ' ' || expanded[e-1] == '\t')) e--;
+        if (e > 0 && expanded[e-1] == '&' &&
+            (e == 1 || expanded[e-2] != '&')) {
+            background = 1;
+            expanded[--e] = '\0';
+            while (e > 0 && (expanded[e-1] == ' ' || expanded[e-1] == '\t'))
+                expanded[--e] = '\0';
         }
-    // Parse arguments
-   
-    char cmd_copy[MAX_LINE];
-    strcpy(cmd_copy, tab->input_line);
+    }
 
-   char *args[64];
-    char storage[MAX_LINE * 64];
-    int argc = shell_split(tab->input_line, args, 64, storage, sizeof(storage));
+    /* Parse the expanded line into argv.  Both buffers live on the heap so
+     * this frame stays small: the session thread's stack must still have
+     * room for execute_pipeline(), which forks a whole pipeline. */
+    char *args[MAX_ARGS];
+    char *storage = malloc(MAX_LINE * 64);
+    if (!storage) {
+        append_output(tab, "terminator: out of memory\n");
+        free(expanded);
+        tab->input_len = 0;
+        tab->input_line[0] = '\0';
+        tab->cursor = 0;
+        return;
+    }
+    int argc = shell_split(expanded, args, MAX_ARGS, storage, MAX_LINE * 64);
 
     if (argc == 0) {
+        free(storage);
+        free(expanded);
         tab->input_len = 0;
         tab->input_line[0] = '\0';
         tab->cursor = 0;
@@ -2341,13 +2613,12 @@ void execute_command(Tab *tab) {
     } else if (strcmp(args[0], "source") == 0 || strcmp(args[0], ".") == 0) {
         builtin_source(tab, args[1]);
     } else {
-        char cmd_copy[MAX_OUTPUT];
-            strncpy(cmd_copy, tab->input_line, sizeof(cmd_copy) - 1);
-            cmd_copy[sizeof(cmd_copy) - 1] = '\0';
-
-            int status = execute_pipeline(tab, cmd_copy, background);
-            if (status != 0) tab->last_exit_status = status;
+        int status = execute_pipeline(tab, expanded, background);
+        if (status != 0) tab->last_exit_status = status;
     }
+
+    free(storage);
+    free(expanded);
 
     tab->scroll = 0;
     tab->input_len = 0;
@@ -2810,6 +3081,39 @@ static void sync_input(Tab *t) {
     if (t->cursor > ilen) t->cursor = ilen;
 }
 
+/* multiline_buf stores every line prefixed with the prompt it was typed
+ * at ("user@terminator> " for the first line, "> " for continuations), so
+ * the accumulated text can be drawn exactly like a real shell.  Recover
+ * the command the user actually typed by dropping one prompt per line. */
+static void strip_prompt_prefixes(const char *in, char *out, int outsz) {
+    int o = 0;
+    const char *p = in;
+    while (*p && o < outsz - 1) {
+        const char *nl = strchr(p, '\n');
+        int len = nl ? (int)(nl - p) : (int)strlen(p);
+        int skip = 0;
+        if (len >= 17 && strncmp(p, "user@terminator> ", 17) == 0) skip = 17;
+        else if (len >= 2 && p[0] == '>' && p[1] == ' ')            skip = 2;
+        for (int i = skip; i < len && o < outsz - 1; i++) out[o++] = p[i];
+        if (!nl) break;
+        if (o < outsz - 1) out[o++] = '\n';
+        p = nl + 1;
+    }
+    out[o] = '\0';
+}
+
+/* Ctrl+C / Ctrl+Z typed at the prompt: show the line just as it was, with
+ * the usual ^C / ^Z marker, then leave a fresh prompt (like a shell does). */
+static void echo_control_marker(Tab *t, char marker) {
+    char buf[2 * MAX_LINE + 32];
+    snprintf(buf, sizeof(buf), "user@terminator> %s^%c\n",
+             t->input_line, marker);
+    append_output(t, buf);
+    t->input_len = 0;
+    t->input_line[0] = '\0';
+    t->cursor = 0;
+}
+
 /* ===================== session transport =====================
  * Everything between a tab's GUI half and its execution half travels
  * as length-prefixed frames:   [type:int][len:int][payload:len]
@@ -3195,7 +3499,14 @@ static TabSession *session_create(Tab *gui_tab, const char *cwd) {
     if (fl >= 0) fcntl(s->from_sess, F_SETFL, fl | O_NONBLOCK);
 
     if (s->mode == EXEC_THREAD) {
-        if (pthread_create(&s->tid, NULL, session_thread_main, s) != 0) {
+        /* A tab shell parses and forks pipelines, so give it a real stack
+         * instead of the tiny (512 KB) default some pthreads use. */
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setstacksize(&attr, 8u * 1024u * 1024u);
+        int rc = pthread_create(&s->tid, &attr, session_thread_main, s);
+        pthread_attr_destroy(&attr);
+        if (rc != 0) {
             perror("pthread_create");
             close(s->to_sess); close(s->from_sess);
             close(s->sfds[0]); close(s->sfds[1]);
@@ -3399,6 +3710,9 @@ int main(int argc, char **argv) {
                     goto cleanup;
                 } else if (event.type == ButtonPress) {
                     Tab *t = &tabs[current_tab];
+                    /* A click anywhere drops a Shift+arrow keyboard
+                     * selection, so the two kinds never stay active at once. */
+                    t->in_sel_active = 0;
                     if (event.xbutton.button == Button4) {
                         t->scroll += 3;
                         clamp_scroll(t);
@@ -3576,10 +3890,7 @@ int main(int argc, char **argv) {
                         if (session_busy(t)) {
                             if (sess) session_send_signal(sess, SIGINT);
                         } else {
-                            t->input_len = 0;
-                            t->input_line[0] = '\0';
-                            t->cursor = 0;
-                            append_output(t, "^C\n");
+                            echo_control_marker(t, 'C');
                         }
                         t->in_sel_active = 0;
                         redraw(display, window, gc, scr);
@@ -3591,10 +3902,7 @@ int main(int argc, char **argv) {
                         if (session_busy(t)) {
                             if (sess) session_send_signal(sess, SIGTSTP);
                         } else {
-                            t->input_len = 0;
-                            t->input_line[0] = '\0';
-                            t->cursor = 0;
-                            append_output(t, "^Z\n");
+                            echo_control_marker(t, 'Z');
                         }
                         t->in_sel_active = 0;
                         redraw(display, window, gc, scr);
@@ -3638,6 +3946,9 @@ int main(int argc, char **argv) {
                     if ((state & ShiftMask) &&
                         (keysym == XK_Left || keysym == XK_Right ||
                          keysym == XK_Home || keysym == XK_End)) {
+                        /* a keyboard selection replaces any mouse selection */
+                        t->sel_active   = 0;
+                        t->sel_dragging = 0;
                         int old = t->cursor;
                         if      (keysym == XK_Left  && t->cursor > 0)            t->cursor--;
                         else if (keysym == XK_Right && t->cursor < t->input_len) t->cursor++;
@@ -3674,20 +3985,35 @@ int main(int argc, char **argv) {
                             }
                             t->in_sel_active = 0;
 
+                            /* Keep the prompt each line was typed at inside
+                             * multiline_buf, so the lines already entered
+                             * stay visible with their prompt while the user
+                             * keeps typing the rest of the command. */
                             if (t->multiline) {
-                                if (t->multiline_len + t->input_len + 2 < (int)sizeof(t->multiline_buf)) {
+                                const char *pfx = "> ";
+                                int pl = 2;
+                                if (t->multiline_len + pl + t->input_len + 2 <
+                                        (int)sizeof(t->multiline_buf)) {
+                                    memcpy(t->multiline_buf + t->multiline_len, pfx, pl);
+                                    t->multiline_len += pl;
                                     memcpy(t->multiline_buf + t->multiline_len,
-                                        t->input_line, t->input_len);
+                                           t->input_line, t->input_len);
                                     t->multiline_len += t->input_len;
                                     t->multiline_buf[t->multiline_len++] = '\n';
                                     t->multiline_buf[t->multiline_len]   = '\0';
                                 }
                             } else {
-                                strncpy(t->multiline_buf, t->input_line, sizeof(t->multiline_buf) - 1);
-                                t->multiline_buf[sizeof(t->multiline_buf) - 1] = '\0';
-                                t->multiline_len = t->input_len;
-                                t->multiline_buf[t->multiline_len++] = '\n';
-                                t->multiline_buf[t->multiline_len]   = '\0';
+                                const char *pfx = "user@terminator> ";
+                                int pl = (int)strlen(pfx);
+                                if (pl + t->input_len + 2 <
+                                        (int)sizeof(t->multiline_buf)) {
+                                    memcpy(t->multiline_buf, pfx, pl);
+                                    memcpy(t->multiline_buf + pl,
+                                           t->input_line, t->input_len);
+                                    t->multiline_len = pl + t->input_len;
+                                    t->multiline_buf[t->multiline_len++] = '\n';
+                                    t->multiline_buf[t->multiline_len]   = '\0';
+                                }
                             }
 
                             if (input_incomplete(t->multiline_buf, t->multiline_len)) {
@@ -3700,9 +4026,10 @@ int main(int argc, char **argv) {
                                 /* complete: run the full accumulated command */
                                 t->multiline = 0;
 
-                                strncpy(t->input_line, t->multiline_buf, MAX_LINE - 1);
-                                t->input_line[MAX_LINE - 1] = '\0';
-                                t->input_len = strlen(t->input_line);
+                                /* drop the prompts we rendered above */
+                                strip_prompt_prefixes(t->multiline_buf,
+                                                      t->input_line, MAX_LINE);
+                                t->input_len = (int)strlen(t->input_line);
 
                                 while (t->input_len > 0 &&
                                     (t->input_line[t->input_len-1] == '\n' ||
