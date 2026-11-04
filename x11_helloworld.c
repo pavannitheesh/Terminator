@@ -22,6 +22,10 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include <limits.h>
+#include <pthread.h>
+#include <semaphore.h>
+#include <sys/mman.h>
+#include <poll.h>
 
 #define MAX_PIPELINE 16          /* max commands in one pipeline */
 #define MAX_ARGS     64          /* max argv per command */
@@ -136,13 +140,151 @@ static int current_tab = 0;
 static int win_w = 800, win_h = 500;
 
 /* ===================== shared command history =====================
- * One history shared by every tab, kept in ~/.terminator_history like
- * bash's ~/.bash_history.  The newest HISTORY_FILE_MAX commands are
- * retained in memory; `history` prints the newest HISTORY_SHOW_MAX.  */
-static char g_history[HISTORY_FILE_MAX][MAX_LINE];
-static int  g_history_count = 0;   /* entries currently stored */
-static long g_history_base  = 0;   /* entries dropped off the front */
-static char g_history_path[1024];
+ * One history shared by every tab.  In thread mode it lives in the
+ * process's memory and is guarded by a pthread mutex; in process mode
+ * it lives in an shm_open()+mmap() segment guarded by a POSIX
+ * process-shared semaphore.  Either way every tab locks it, so a
+ * command typed in one tab shows up in the others.                  */
+typedef struct {
+    sem_t           sem;          /* process mode lock (shared) */
+    pthread_mutex_t mutex;        /* thread mode lock */
+    int             count;        /* entries currently stored */
+    long            base;         /* entries dropped off the front */
+    char            entries[HISTORY_FILE_MAX][MAX_LINE];
+} History;
+
+static History *H = NULL;             /* the one shared history */
+static int      g_use_process = 0;    /* 0 = thread mode, 1 = process mode */
+static char     g_history_path[1024];
+
+#define g_history       (H->entries)
+#define g_history_count (H->count)
+#define g_history_base  (H->base)
+
+static void history_lock(void) {
+    if (g_use_process) sem_wait(&H->sem);
+    else               pthread_mutex_lock(&H->mutex);
+}
+static void history_unlock(void) {
+    if (g_use_process) sem_post(&H->sem);
+    else               pthread_mutex_unlock(&H->mutex);
+}
+
+/* Create the one shared history.  Thread mode: plain process memory with
+ * a pthread mutex.  Process mode: shm_open()+mmap(MAP_SHARED) so parent
+ * and every forked tab see the same records, with a process-shared
+ * semaphore (sem_init pshared=1) as the lock. */
+#define HISTORY_SHM_NAME "/terminator_history"
+
+static void history_init(void) {
+    if (g_use_process) {
+        int fd = shm_open(HISTORY_SHM_NAME, O_CREAT | O_RDWR, 0600);
+        if (fd < 0) { perror("shm_open"); exit(1); }
+        if (ftruncate(fd, (off_t)sizeof(History)) < 0) {
+            perror("ftruncate"); close(fd); exit(1);
+        }
+        void *p = mmap(NULL, sizeof(History), PROT_READ | PROT_WRITE,
+                       MAP_SHARED, fd, 0);
+        close(fd);
+        if (p == MAP_FAILED) { perror("mmap"); exit(1); }
+        /* keep the segment anonymous for this run only */
+        shm_unlink(HISTORY_SHM_NAME);
+        H = (History *)p;
+        if (sem_init(&H->sem, 1, 1) < 0) { perror("sem_init"); exit(1); }
+        H->count = 0;
+        H->base  = 0;
+    } else {
+        H = calloc(1, sizeof(History));
+        if (!H) { perror("calloc"); exit(1); }
+        pthread_mutex_init(&H->mutex, NULL);
+    }
+}
+
+/* ===================== per-tab execution sessions =====================
+ * Every tab runs its shell in its own execution context, so that
+ * closing or crashing one tab cannot take the others down:
+ *
+ *   thread mode  (./terminator)
+ *       one pthread per tab; the tabs share the process's memory and
+ *       commands travel through a mutex-protected buffer.
+ *   process mode (./terminator useProcess=True)
+ *       the GUI forks one child per tab and talks to it over two pipes;
+ *       history stays in shared memory guarded by a process-shared
+ *       semaphore, and the GUI stays in the parent.
+ *
+ * Only the GUI touches X11.  A session never renders: it streams small
+ * frames back to the GUI, which feeds them into the tab's display.
+ */
+enum { EXEC_THREAD = 0, EXEC_PROCESS = 1 };
+
+/* session -> GUI frames */
+enum { F_OUT = 1, F_CWD, F_BUSY, F_QUIT, F_DELEGATE };
+/* GUI -> session frames */
+enum { C_RUN = 1, C_SIG, C_CLOSE };
+
+#define SES_CHUNK 2048
+#define SES_IOBUF (64 * 1024)
+
+typedef struct TabSession {
+    int   mode;
+    Tab  *shell;                 /* this session's private shell state */
+    Tab  *gui_tab;               /* the tab it draws into (GUI side only) */
+
+    /* Transport.  to_sess/from_sess are the GUI's ends of the two pipes;
+     * sfds[] are the session's ends, used by the thread or forked child.
+     *   GUI --write->to_sess==sfds[0]--read-->  session
+     *   GUI <-read--from_sess==sfds[1]<-write-- session            */
+    int   to_sess;
+    int   from_sess;
+    int   sfds[2];
+
+    char  rbuf[SES_IOBUF];       /* GUI side: partial-frame accumulator */
+    int   rlen;
+    char  cbuf[SES_IOBUF];       /* session side: partial-frame accumulator */
+    int   clen;
+
+    /* thread mode */
+    pthread_t tid;
+
+    /* process mode */
+    pid_t pid;
+
+    int   quitting;              /* session: stop the loop */
+    int   user_exit;             /* session: the user typed `exit` */
+    int   busy;                  /* GUI: a foreground job / watch is running */
+    int   alive;                 /* GUI: session still usable */
+    int   closing;               /* GUI: asked the session to stop */
+    int   gui_quit;              /* GUI: the session asked this tab to quit */
+    int   dead;                  /* GUI: session vanished unexpectedly */
+    int   notified;              /* GUI: already reported a dead session */
+} TabSession;
+
+static TabSession *sessions[MAX_TABS];
+
+/* Set inside a session thread / forked child; NULL while the GUI runs.
+ * It is how append_output() knows whether it belongs to the GUI or to a
+ * tab session that must stream its output back instead. */
+static __thread TabSession *g_sess = NULL;
+
+static TabSession *session_create(Tab *gui_tab, const char *cwd);
+static void session_close(TabSession *s);
+static void session_destroy_all(void);
+static int  session_gui_fd(TabSession *s);
+static int  session_gui_drain(TabSession *s);
+static void session_send_run(TabSession *s, const char *line);
+static void session_send_signal(TabSession *s, int sig);
+static void session_emit(TabSession *s, const char *data, int len);
+static void session_emit_int(TabSession *s, int type, int value);
+static void session_emit_cwd(TabSession *s, const char *cwd);
+static void session_emit_line(TabSession *s, int type, const char *line);
+
+/* Is the GUI tab `gui_tab` currently running a foreground command? */
+static int session_busy(Tab *gui_tab) {
+    int idx = (int)(gui_tab - tabs);
+    if (idx < 0 || idx >= MAX_TABS) return 0;
+    TabSession *s = sessions[idx];
+    return (s && s->alive && s->busy) ? 1 : 0;
+}
 
 /* ===================== configurable key bindings =====================
  * A table of (modifiers, KeySym) -> action. Loaded from ~/.terminatorrc
@@ -447,6 +589,12 @@ static void rewrite_config(void) {
 /* ===================================================================== */
 
 void append_output(Tab *tab, const char *str) {
+    /* Inside a tab session this buffer belongs to the GUI: stream the
+     * text back over the session pipe instead of writing it locally. */
+    if (g_sess != NULL && tab == g_sess->shell) {
+        session_emit(g_sess, str, (int)strlen(str));
+        return;
+    }
     int len = strlen(str);
     if (tab->output_len + len < MAX_OUTPUT - 1) {
         strcpy(tab->output_buffer + tab->output_len, str);
@@ -542,10 +690,12 @@ static int shell_split(const char *line, char **args, int maxargs,
 }
 
 /* Expand wildcard arguments in argv[] in place.
+ * Relative patterns are matched against `cwd` (the tab's directory), never
+ * the process cwd, so one tab's `cd` can't affect another tab's globs.
  * Non-matching args are kept literally (POSIX shell behaviour).
  * Returns the new argc. */
 static int expand_globs(char **argv, int argc,
-                        char **new_argv, int new_max) {
+                        char **new_argv, int new_max, const char *cwd) {
     int out = 0;
 
     for (int i = 0; i < argc; i++) {
@@ -559,11 +709,27 @@ static int expand_globs(char **argv, int argc,
             continue;
         }
 
+        /* Rewrite a relative pattern to an absolute one rooted at the tab
+         * cwd, then strip that prefix from the results so the argv entries
+         * keep their original (relative) shape. */
+        char prefix[PATH_MAX];
+        char pattern[PATH_MAX];
+        const char *pat = arg;
+        prefix[0] = '\0';
+        if (arg[0] != '/' && cwd && cwd[0]) {
+            snprintf(prefix, sizeof(prefix), "%s/", cwd);
+            snprintf(pattern, sizeof(pattern), "%s%s", prefix, arg);
+            pat = pattern;
+        }
+
         glob_t g;
-        int rc = glob(arg, GLOB_NOCHECK, NULL, &g);
+        int rc = glob(pat, GLOB_NOCHECK, NULL, &g);
         if (rc == 0) {
+            size_t plen = strlen(prefix);
             for (size_t k = 0; k < g.gl_pathc && out < new_max - 1; k++) {
-                new_argv[out++] = strdup(g.gl_pathv[k]);
+                const char *r = g.gl_pathv[k];
+                if (plen > 0 && strncmp(r, prefix, plen) == 0) r += plen;
+                new_argv[out++] = strdup(r);
             }
             globfree(&g);
         } else {
@@ -700,6 +866,16 @@ static int expand_globs(char **argv, int argc,
 }
 
 
+/* Resolve a filename against the TAB's cwd instead of the process cwd.
+ * In thread mode every tab shares one process cwd, so relying on it would
+ * let a `cd` in one tab silently redirect another tab's relative paths.
+ * Returns `buf` when a rewrite happened, otherwise the original pointer. */
+static const char *tab_path(Tab *tab, const char *name, char *buf, size_t sz) {
+    if (name[0] == '/' || !tab || tab->cwd[0] == '\0') return name;
+    snprintf(buf, sz, "%s/%s", tab->cwd, name);
+    return buf;
+}
+
 /* Open redirection fds for `cmd`. Fills *in_fd / *out_fd (-1 if unused).
  * Returns 0 on success, -1 on error (message already appended). */
  int open_redirections(Tab *tab, Command *cmd, int *in_fd, int *out_fd) {
@@ -707,7 +883,8 @@ static int expand_globs(char **argv, int argc,
     *out_fd = -1;
 
     if (cmd->in_file[0]) {
-        *in_fd = open(cmd->in_file, O_RDONLY);
+        char p[PATH_MAX];
+        *in_fd = open(tab_path(tab, cmd->in_file, p, sizeof(p)), O_RDONLY);
         if (*in_fd < 0) {
             char err[1200];
             snprintf(err, sizeof(err),
@@ -717,7 +894,9 @@ static int expand_globs(char **argv, int argc,
         }
     }
     if (cmd->out_file[0]) {
-        *out_fd = open(cmd->out_file, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        char p[PATH_MAX];
+        *out_fd = open(tab_path(tab, cmd->out_file, p, sizeof(p)),
+                       O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (*out_fd < 0) {
             char err[1200];
             snprintf(err, sizeof(err),
@@ -759,12 +938,6 @@ static int job_alloc(Tab *t) {
         }
     }
     return -1;
-}
-
-static int job_count(Tab *t) {
-    int n = 0;
-    for (int i = 0; i < MAX_JOBS; i++) if (t->jobs[i].used) n++;
-    return n;
 }
 
 static Job *foreground_job(Tab *t) {
@@ -879,8 +1052,9 @@ static int execute_pipeline(Tab *tab, char *line, int background) {
         return 1;
     }
 
-    /* 2) Parse each segment (redirections + argv) */
-    static char storage[MAX_PIPELINE][MAX_STORAGE];
+    /* 2) Parse each segment (redirections + argv).  These are automatic,
+     * not static: in thread mode several tab shells parse concurrently. */
+    char storage[MAX_PIPELINE][MAX_STORAGE];
     Command cmds[MAX_PIPELINE];
 
     for (int i = 0; i < n; i++) {
@@ -894,11 +1068,11 @@ static int execute_pipeline(Tab *tab, char *line, int background) {
             return 1;
         }
     }
-    static char *glob_storage[MAX_PIPELINE][MAX_ARGS];
+    char *glob_storage[MAX_PIPELINE][MAX_ARGS];
 
     for (int i = 0; i < n; i++) {
         int newc = expand_globs(cmds[i].argv, cmds[i].argc,
-                                glob_storage[i], MAX_ARGS);
+                                glob_storage[i], MAX_ARGS, tab->cwd);
         /* Repoint argv at the expanded array */
         memcpy(cmds[i].argv, glob_storage[i], sizeof(char*) * (newc + 1));
         cmds[i].argc = newc;
@@ -975,6 +1149,15 @@ static int execute_pipeline(Tab *tab, char *line, int background) {
                 if (out_fds[k] >= 0) close(out_fds[k]);
             }
 
+            signal(SIGPIPE, SIG_DFL);   /* undoes the GUI's SIG_IGN */
+            /* Reset dispositions the launcher ignored, so job control works
+               identically in thread mode (the GUI's SIG_IGN would otherwise
+               be inherited and make the job unkillable by Ctrl+C/Ctrl+Z). */
+            signal(SIGINT,  SIG_DFL);
+            signal(SIGQUIT, SIG_DFL);
+            signal(SIGTSTP, SIG_DFL);
+            signal(SIGTTIN, SIG_DFL);
+            signal(SIGTTOU, SIG_DFL);
             chdir(tab->cwd);
             execvp(cmds[i].argv[0], cmds[i].argv);
             fprintf(stderr, "terminator: %s: command not found\n", cmds[i].argv[0]);
@@ -1082,6 +1265,14 @@ void init_tab(Tab *tab, int id) {
     // char welcome[128];
     // snprintf(welcome, sizeof(welcome), "Terminator Tab %d initialized.\n", id);
     // append_output(tab, welcome);
+
+    /* Every tab gets its own execution session: a pthread in thread mode,
+     * a fork()ed child in process mode.  The GUI only renders. */
+    int idx = (int)(tab - tabs);
+    if (idx >= 0 && idx < MAX_TABS) {
+        if (sessions[idx]) { session_close(sessions[idx]); sessions[idx] = NULL; }
+        sessions[idx] = session_create(tab, tab->cwd);
+    }
 }
 
 // Compute layout of tab i in window coordinates.
@@ -1104,6 +1295,13 @@ static void tab_layout(int i, int *label_x, int *label_w,
 
 void close_tab(int index) {
     if (num_tabs <= 1) return;          // keep at least one tab
+
+    /* Stop this tab's execution session.  The GUI tab owns no jobs any
+     * more: the session does, and it tears its own children down. */
+    if (sessions[index]) {
+        session_close(sessions[index]);
+        sessions[index] = NULL;
+    }
 
     Tab *t = &tabs[index];
 
@@ -1139,10 +1337,13 @@ void close_tab(int index) {
    int moved = num_tabs - index - 1;
     if (moved > 0) {
         memmove(&tabs[index], &tabs[index + 1], moved * sizeof(Tab));
+        memmove(&sessions[index], &sessions[index + 1],
+                moved * sizeof(TabSession *));
     }
 
     // 3) Wipe the now-vacated tail slot so no stale fd/pid/data remains.
     memset(&tabs[num_tabs - 1], 0, sizeof(Tab));
+    sessions[num_tabs - 1] = NULL;
     for (int i = 0; i < MAX_JOBS; i++)
         tabs[num_tabs - 1].jobs[i].pipe_fd = -1;
     tabs[num_tabs - 1].cur_job = -1;
@@ -1158,6 +1359,10 @@ void close_tab(int index) {
     } else if (current_tab >= num_tabs) {
         current_tab = num_tabs - 1;
     }
+
+    /* tabs[] shifted, so re-point every session at its tab. */
+    for (int i = 0; i < num_tabs; i++)
+        if (sessions[i]) sessions[i]->gui_tab = &tabs[i];
 }
 
 /* ===================== line-editing actions ===================== */
@@ -1173,7 +1378,7 @@ static void history_path_init(void) {
 }
 
 /* append one command to the in-memory history, dropping the oldest
- * entry once HISTORY_FILE_MAX is reached */
+ * entry once HISTORY_FILE_MAX is reached.  The caller holds the lock. */
 static void history_store(const char *cmd) {
     if (!cmd || !*cmd) return;
     if (g_history_count < HISTORY_FILE_MAX) {
@@ -1197,12 +1402,15 @@ static void history_append_file(const char *cmd) {
 
 /* rewrite the file so it holds exactly the in-memory history */
 static void history_save_file(void) {
+    history_lock();
     if (!g_history_path[0]) history_path_init();
     FILE *f = fopen(g_history_path, "w");
-    if (!f) return;
-    for (int i = 0; i < g_history_count; i++)
-        fprintf(f, "%s\n", g_history[i]);
-    fclose(f);
+    if (f) {
+        for (int i = 0; i < g_history_count; i++)
+            fprintf(f, "%s\n", g_history[i]);
+        fclose(f);
+    }
+    history_unlock();
 }
 
 /* read ~/.terminator_history at startup; trim it back to the cap */
@@ -1212,6 +1420,7 @@ static void history_load(void) {
     if (!f) return;
     char line[MAX_LINE];
     int  read = 0;
+    history_lock();
     while (fgets(line, sizeof(line), f)) {
         size_t n = strlen(line);
         while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r'))
@@ -1220,6 +1429,7 @@ static void history_load(void) {
         history_store(line);
         read++;
     }
+    history_unlock();
     fclose(f);
     if (read > HISTORY_FILE_MAX) history_save_file();   /* drop the oldest */
 }
@@ -1256,11 +1466,13 @@ static void run_history_search(Tab *t) {
         return;
     }
 
+    history_lock();
     /* (a) most recent command that exactly matches the term */
     for (int i = g_history_count - 1; i >= 0; i--) {
         if (strcmp(g_history[i], term) == 0) {
             char buf[MAX_LINE + 2];
             snprintf(buf, sizeof(buf), "%s\n", g_history[i]);
+            history_unlock();
             append_output(t, buf);
             return;
         }
@@ -1280,8 +1492,10 @@ static void run_history_search(Tab *t) {
                 append_output(t, buf);
             }
         }
+        history_unlock();
         return;
     }
+    history_unlock();
 
     append_output(t, "No match for search term in history\n");
 }
@@ -1441,16 +1655,19 @@ static void do_completion(Tab *t) {
 }
 
 static void history_prev(Tab *t) {
-    if (g_history_count == 0) return;
+    history_lock();
+    if (g_history_count == 0) { history_unlock(); return; }
     if (t->hist_pos == -1) {
         snprintf(t->hist_save, sizeof(t->hist_save), "%s", t->input_line);
         t->hist_pos = g_history_count - 1;
     } else if (t->hist_pos > 0) {
         t->hist_pos--;
     } else {
+        history_unlock();
         return;
     }
     snprintf(t->input_line, sizeof(t->input_line), "%s", g_history[t->hist_pos]);
+    history_unlock();
     t->input_len = (int)strlen(t->input_line);
     t->cursor = t->input_len;
     t->sel_active = 0;
@@ -1458,6 +1675,7 @@ static void history_prev(Tab *t) {
 
 static void history_next(Tab *t) {
     if (t->hist_pos == -1) return;
+    history_lock();
     if (t->hist_pos < g_history_count - 1) {
         t->hist_pos++;
         snprintf(t->input_line, sizeof(t->input_line), "%s", g_history[t->hist_pos]);
@@ -1465,6 +1683,7 @@ static void history_next(Tab *t) {
         t->hist_pos = -1;
         snprintf(t->input_line, sizeof(t->input_line), "%s", t->hist_save);
     }
+    history_unlock();
     t->input_len = (int)strlen(t->input_line);
     t->cursor = t->input_len;
     t->sel_active = 0;
@@ -1648,19 +1867,25 @@ static int start_watch_cmd(Tab *tab, int idx) {
     if (pipe(pfd) < 0) return -1;
 
     pid_t pid = fork();
-    if (pid < 0) {
-        close(pfd[0]);
-        close(pfd[1]);
-        return -1;
-    }
+    if (pid < 0) { close(pfd[0]); close(pfd[1]); return -1; }
     if (pid == 0) {
         setpgid(0, 0);
         close(pfd[0]);
         dup2(pfd[1], STDOUT_FILENO);
         dup2(pfd[1], STDERR_FILENO);
         close(pfd[1]);
+        signal(SIGPIPE, SIG_DFL);
+        signal(SIGINT,  SIG_DFL);
+        signal(SIGQUIT, SIG_DFL);
+        signal(SIGTSTP, SIG_DFL);
         if (chdir(tab->cwd) < 0) _exit(126);
-        execl("/bin/sh", "sh", "-c", w->cmd, (char *)NULL);
+        // --- replace the execl("/bin/sh",...) with your own parse+exec ---
+        char storage[MAX_STORAGE];
+        Command cmd;
+        if (parse_command(w->cmd, &cmd, storage, sizeof(storage)) < 0 ||
+            cmd.argv[0] == NULL)
+            _exit(127);
+        execvp(cmd.argv[0], cmd.argv);
         _exit(127);
     }
     setpgid(pid, pid);
@@ -1754,21 +1979,6 @@ static void restart_due_watches(Tab *tab) {
         if (!w->running && w->next_run != 0 && now >= w->next_run)
             start_watch_cmd(tab, i);
     }
-}
-
-static time_t next_watch_deadline(void) {
-    time_t soonest = 0;
-    for (int t = 0; t < num_tabs; t++) {
-        if (!tabs[t].watching) continue;
-        for (int i = 0; i < tabs[t].nwatch; i++) {
-            WatchCmd *w = &tabs[t].watches[i];
-            if (!w->running && w->next_run != 0) {
-                if (soonest == 0 || w->next_run < soonest)
-                    soonest = w->next_run;
-            }
-        }
-    }
-    return soonest;
 }
 
 static int start_multiwatch(Tab *tab, const char *line) {
@@ -1951,7 +2161,7 @@ static void builtin_fg(Tab *t, const char *spec) {
     }
 }
 
-static int source_depth = 0;
+static __thread int source_depth = 0;
 
 static void builtin_source(Tab *t, const char *path) {
     if (!path) {
@@ -1969,7 +2179,8 @@ static void builtin_source(Tab *t, const char *path) {
         t->last_exit_status = 1;
         return;
     }
-    FILE *fp = fopen(name, "r");
+    char full[PATH_MAX + MAX_LINE];
+    FILE *fp = fopen(tab_path(t, name, full, sizeof(full)), "r");
     if (!fp) {
         char err[MAX_LINE + 64];
         snprintf(err, sizeof(err),
@@ -2003,8 +2214,10 @@ void execute_command(Tab *tab) {
 
     /* Record in the shared, file-backed history so every tab sees it. */
     if (tab->input_line[0]) {
+        history_lock();
         history_store(tab->input_line);
         history_append_file(tab->input_line);
+        history_unlock();
     }
 
     /* A trailing '&' starts the command as a background job. */
@@ -2043,7 +2256,7 @@ void execute_command(Tab *tab) {
     strcpy(cmd_copy, tab->input_line);
 
    char *args[64];
-    static char storage[MAX_LINE * 64];
+    char storage[MAX_LINE * 64];
     int argc = shell_split(tab->input_line, args, 64, storage, sizeof(storage));
 
     if (argc == 0) {
@@ -2055,15 +2268,42 @@ void execute_command(Tab *tab) {
 
     // Handle Built-ins
     if (strcmp(args[0], "exit") == 0) {
-        exit(0);
+        if (g_sess) {
+            /* inside a tab session: close just this tab, don't kill the GUI */
+            g_sess->user_exit = 1;
+            g_sess->quitting  = 1;
+        } else {
+            exit(0);
+        }
     } else if (strcmp(args[0], "cd") == 0) {
+        /* Resolve against THIS tab's directory, never the process's, so a
+         * `cd` in one tab cannot move another tab (matters in thread mode,
+         * where every tab shares the process cwd). */
         char *target = args[1];
-        // if (!target || strcmp(target, "~") == 0) {
-        //     struct passwd *pw = getpwuid(getuid());
-        //     target = pw ? pw->dir : getenv("HOME"); 
-        // }
-        if (chdir(target) == 0) {
-            getcwd(tab->cwd, sizeof(tab->cwd));
+        char  path[PATH_MAX];
+        char  resolved[PATH_MAX];
+
+        if (!target || !*target || strcmp(target, "~") == 0) {
+            const char *home = getenv("HOME");
+            snprintf(path, sizeof(path), "%s", (home && *home) ? home : "/");
+        } else if (target[0] == '~' && target[1] == '/') {
+            const char *home = getenv("HOME");
+            if (!home || !*home) home = "/";
+            snprintf(path, sizeof(path), "%s%s", home, target + 1);
+        } else if (target[0] == '/') {
+            snprintf(path, sizeof(path), "%s", target);
+        } else {
+            snprintf(path, sizeof(path), "%s/%s", tab->cwd, target);
+        }
+
+        /* Update ONLY this tab's directory.  Deliberately no process-wide
+         * chdir(): in thread mode that would move every other tab too.
+         * Relative paths for commands, globs and redirections are resolved
+         * against tab->cwd instead of the process cwd. */
+        struct stat st;
+        if (realpath(path, resolved) && stat(resolved, &st) == 0 &&
+            S_ISDIR(st.st_mode)) {
+            snprintf(tab->cwd, sizeof(tab->cwd), "%s", resolved);
             update_tab_title(tab);
             tab->last_exit_status = 0;
         } else {
@@ -2074,6 +2314,7 @@ void execute_command(Tab *tab) {
         }
     } else if (strcmp(args[0], "history") == 0) {
         /* most recent HISTORY_SHOW_MAX commands from the shared history */
+        history_lock();
         int shown = g_history_count < HISTORY_SHOW_MAX ? g_history_count
                                                        : HISTORY_SHOW_MAX;
         int start = g_history_count - shown;
@@ -2083,11 +2324,14 @@ void execute_command(Tab *tab) {
                      g_history_base + i + 1, g_history[i]);
             append_output(tab, hist_buf);
         }
+        history_unlock();
         tab->last_exit_status = 0;
     } else if (strcmp(args[0], "multiWatch") == 0) {
         start_multiwatch(tab, tab->input_line);
     } else if (strcmp(args[0], "bind") == 0) {
-        handle_bind(tab, args, argc);
+        /* key bindings live in the GUI; a session hands the command back */
+        if (g_sess) session_emit_line(g_sess, F_DELEGATE, tab->input_line);
+        else        handle_bind(tab, args, argc);
     } else if (strcmp(args[0], "jobs") == 0) {
         builtin_jobs(tab);
     } else if (strcmp(args[0], "fg") == 0) {
@@ -2531,7 +2775,7 @@ void redraw(Display *display, Window window, GC gc, int screen) {
     /* Prompt: only shown when following the latest output (scroll == 0)
      * and no foreground job owns the terminal.  While a command runs the
      * prompt stays hidden, exactly like a real shell. */
-    if (t->scroll == 0 && foreground_job(t) == NULL) {
+    if (t->scroll == 0 && !session_busy(t)) {
         const char *prompt = t->search_mode ? "Enter search term: "
                            : t->multiline   ? "> "
                                             : "user@terminator> ";
@@ -2566,7 +2810,498 @@ static void sync_input(Tab *t) {
     if (t->cursor > ilen) t->cursor = ilen;
 }
 
-int main(void) {
+/* ===================== session transport =====================
+ * Everything between a tab's GUI half and its execution half travels
+ * as length-prefixed frames:   [type:int][len:int][payload:len]
+ * The GUI writes C_* frames to the session, the session writes F_*
+ * frames back.  A frame never exceeds SES_IOBUF.
+ */
+static int write_full(int fd, const void *buf, size_t len) {
+    const char *p = (const char *)buf;
+    size_t off = 0;
+    while (off < len) {
+        ssize_t n = write(fd, p + off, len - off);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;              /* EPIPE / EAGAIN: abandon this frame */
+        }
+        if (n == 0) return -1;
+        off += (size_t)n;
+    }
+    return 0;
+}
+
+static int frame_write(int fd, int type, const void *payload, int len) {
+    int hdr[2];
+    if (fd < 0) return -1;
+    hdr[0] = type;
+    hdr[1] = len;
+    if (write_full(fd, hdr, sizeof(hdr)) < 0) return -1;
+    if (len > 0 && payload && write_full(fd, payload, (size_t)len) < 0) return -1;
+    return 0;
+}
+
+/* One complete frame in buf?  Fills type/plen and returns 1; returns 0
+ * when more bytes are needed; resets the buffer and returns -1 on a
+ * corrupt length. */
+static int frame_ready(const char *buf, int have, int *type, int *plen) {
+    int hdr = (int)(2 * sizeof(int));
+    if (have < hdr) return 0;
+    memcpy(type, buf, sizeof(int));
+    memcpy(plen, buf + sizeof(int), sizeof(int));
+    if (*plen < 0 || *plen > SES_IOBUF) return -1;
+    if (have < hdr + *plen) return 0;
+    return 1;
+}
+
+static void session_emit(TabSession *s, const char *data, int len) {
+    int off = 0;
+    if (!s || len <= 0) return;
+    while (off < len) {
+        int chunk = len - off;
+        if (chunk > SES_CHUNK) chunk = SES_CHUNK;
+        if (frame_write(s->sfds[1], F_OUT, data + off, chunk) < 0) return;
+        off += chunk;
+    }
+}
+
+static void session_emit_int(TabSession *s, int type, int value) {
+    if (s) frame_write(s->sfds[1], type, &value, (int)sizeof(value));
+}
+
+static void session_emit_line(TabSession *s, int type, const char *line) {
+    if (s) frame_write(s->sfds[1], type, line, (int)strlen(line));
+}
+
+static void session_emit_cwd(TabSession *s, const char *cwd) {
+    session_emit_line(s, F_CWD, cwd);
+}
+
+static void session_send_run(TabSession *s, const char *line) {
+    if (!s || s->to_sess < 0) return;
+    frame_write(s->to_sess, C_RUN, line, (int)strlen(line));
+}
+
+static void session_send_signal(TabSession *s, int sig) {
+    if (!s || s->to_sess < 0) return;
+    frame_write(s->to_sess, C_SIG, &sig, (int)sizeof(sig));
+}
+
+static int session_gui_fd(TabSession *s) {
+    return s ? s->from_sess : -1;
+}
+
+/* Apply one frame the session sent, on the GUI side. */
+static void session_gui_frame(TabSession *s, int type, char *payload, int len) {
+    Tab *gt = s->gui_tab;
+    switch (type) {
+    case F_OUT:
+        if (gt) {
+            char tmp[SES_CHUNK + 1];
+            int c = len < SES_CHUNK ? len : SES_CHUNK;
+            memcpy(tmp, payload, (size_t)c);
+            tmp[c] = '\0';
+            append_output(gt, tmp);
+        }
+        break;
+    case F_CWD:
+        if (gt) {
+            int c = len < (int)sizeof(gt->cwd) - 1 ? len : (int)sizeof(gt->cwd) - 1;
+            memcpy(gt->cwd, payload, (size_t)c);
+            gt->cwd[c] = '\0';
+            update_tab_title(gt);
+        }
+        break;
+    case F_BUSY:
+        if (len >= (int)sizeof(int)) {
+            int v;
+            memcpy(&v, payload, sizeof(int));
+            s->busy = v ? 1 : 0;
+        }
+        break;
+    case F_QUIT:
+        s->gui_quit = 1;             /* session asked this tab to close */
+        break;
+    case F_DELEGATE:
+        /* A built-in that only the GUI can run (key bindings). */
+        if (gt && len > 0 && len < MAX_LINE) {
+            char tmp[MAX_LINE];
+            char *args[MAX_ARGS];
+            static __thread char storage[MAX_LINE * 64];
+            memcpy(tmp, payload, (size_t)len);
+            tmp[len] = '\0';
+            int argc = shell_split(tmp, args, MAX_ARGS, storage, sizeof(storage));
+            if (argc > 0 && strcmp(args[0], "bind") == 0)
+                handle_bind(gt, args, argc);
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+/* Non-blocking: pull everything the session has produced and dispatch it. */
+static int session_gui_drain(TabSession *s) {
+    int got = 0;
+    if (!s || s->from_sess < 0) return 0;
+
+    for (;;) {
+        if (s->rlen >= SES_IOBUF) s->rlen = 0;      /* corrupt: drop it */
+        ssize_t n = read(s->from_sess, s->rbuf + s->rlen,
+                         (size_t)(SES_IOBUF - s->rlen));
+        if (n > 0) { s->rlen += (int)n; got = 1; continue; }
+        if (n == 0) { s->alive = 0; s->dead = 1; break; }
+        if (errno == EINTR) continue;
+        if (errno != EAGAIN && errno != EWOULDBLOCK) { s->alive = 0; s->dead = 1; }
+        break;
+    }
+
+    int hdr = (int)(2 * sizeof(int));
+    while (s->rlen >= hdr) {
+        int type = 0, plen = 0, ok = frame_ready(s->rbuf, s->rlen, &type, &plen);
+        if (ok < 0) { s->rlen = 0; break; }
+        if (ok == 0) break;
+        session_gui_frame(s, type, s->rbuf + hdr, plen);
+        int used = hdr + plen;
+        memmove(s->rbuf, s->rbuf + used, (size_t)(s->rlen - used));
+        s->rlen -= used;
+    }
+    return got;
+}
+
+/* ===================== session lifecycle ===================== */
+
+/* A tab's private shell state.  It starts from the GUI tab's directory
+ * and from then on is completely independent: its own cwd, jobs and
+ * multiWatch timers never leak into another tab. */
+static void session_shell_reset(Tab *t, const char *cwd) {
+    memset(t, 0, sizeof(*t));
+    if (cwd && cwd[0]) snprintf(t->cwd, sizeof(t->cwd), "%s", cwd);
+    else if (!getcwd(t->cwd, sizeof(t->cwd))) t->cwd[0] = '\0';
+    update_tab_title(t);
+    t->hist_pos = -1;
+    t->cur_job  = -1;
+    t->fg_job   = -1;
+    for (int i = 0; i < MAX_JOBS;  i++) t->jobs[i].pipe_fd    = -1;
+    for (int i = 0; i < MAX_WATCH; i++) t->watches[i].pipe_fd = -1;
+}
+
+/* Ctrl+C / Ctrl+Z arrives from the GUI as a frame: act on this tab's
+ * own foreground job only. */
+static void session_do_signal(TabSession *s, int sig) {
+    Tab *sh = s->shell;
+    Job *j = foreground_job(sh);
+
+    if (sig == SIGINT) {
+        if (j) {
+            kill(-j->pgid, SIGINT);
+            kill(-j->pgid, SIGCONT);
+            append_output(sh, "^C\n");
+        } else if (sh->watching) {
+            stop_multiwatch(sh, 1);
+        } else {
+            append_output(sh, "^C\n");
+        }
+    } else if (sig == SIGTSTP) {
+        if (j) {
+            int idx = sh->fg_job;
+            kill(-j->pgid, SIGTSTP);
+            append_output(sh, "^Z\n");
+            job_reap(sh, idx, 1);        /* report the suspend now */
+            tab_reap_jobs(sh);
+        } else {
+            append_output(sh, "^Z\n");
+        }
+    }
+}
+
+/* Consume GUI->session frames sitting in s->cbuf. */
+static void session_handle_frames(TabSession *s, int *did_run) {
+    int hdr = (int)(2 * sizeof(int));
+    char line[MAX_LINE];
+
+    while (s->clen >= hdr) {
+        int type = 0, plen = 0, ok = frame_ready(s->cbuf, s->clen, &type, &plen);
+        if (ok < 0) { s->clen = 0; break; }
+        if (ok == 0) break;
+
+        char *payload = s->cbuf + hdr;
+        switch (type) {
+        case C_RUN: {
+            int c = plen < MAX_LINE - 1 ? plen : MAX_LINE - 1;
+            memcpy(line, payload, (size_t)c);
+            line[c] = '\0';
+            Tab *sh = s->shell;
+            snprintf(sh->input_line, MAX_LINE, "%s", line);
+            sh->input_len = (int)strlen(sh->input_line);
+            sh->cursor    = sh->input_len;
+            sh->scroll    = 0;
+            execute_command(sh);
+            session_emit_cwd(s, sh->cwd);
+            if (did_run) *did_run = 1;
+            break;
+        }
+        case C_SIG:
+            if (plen >= (int)sizeof(int)) {
+                int sig;
+                memcpy(&sig, payload, sizeof(sig));
+                session_do_signal(s, sig);
+            }
+            break;
+        case C_CLOSE:
+            s->quitting = 1;
+            break;
+        default:
+            break;
+        }
+
+        int used = hdr + plen;
+        memmove(s->cbuf, s->cbuf + used, (size_t)(s->clen - used));
+        s->clen -= used;
+    }
+}
+
+/* The heart of a tab's execution half: run in the session thread (thread
+ * mode) or in the forked child (process mode).  It owns the shell state,
+ * runs the commands, reaps jobs, ticks multiWatch, and streams whatever
+ * the shell prints back to the GUI.  It never touches X11. */
+static void session_run_loop(TabSession *s) {
+    g_sess = s;
+    Tab *sh = s->shell;
+    int last_busy = -1;
+
+    session_emit_cwd(s, sh->cwd);
+
+    while (!s->quitting) {
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(s->sfds[0], &rfds);
+        int max_fd = s->sfds[0];
+
+        for (int k = 0; k < MAX_JOBS; k++) {
+            int fd = sh->jobs[k].pipe_fd;
+            if (sh->jobs[k].used && fd >= 0) {
+                FD_SET(fd, &rfds);
+                if (fd > max_fd) max_fd = fd;
+            }
+        }
+        if (sh->watching) {
+            for (int w = 0; w < sh->nwatch; w++) {
+                int fd = sh->watches[w].pipe_fd;
+                if (fd >= 0) {
+                    FD_SET(fd, &rfds);
+                    if (fd > max_fd) max_fd = fd;
+                }
+            }
+        }
+
+        struct timeval tv;
+        tv.tv_sec  = 0;
+        tv.tv_usec = 200000;             /* wake up to tick multiWatch */
+        int r = select(max_fd + 1, &rfds, NULL, NULL, &tv);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+
+        int did_run = 0;
+        if (r > 0 && FD_ISSET(s->sfds[0], &rfds)) {
+            char buf[SES_CHUNK];
+            ssize_t n = read(s->sfds[0], buf, sizeof(buf));
+            if (n == 0) break;           /* GUI went away */
+            if (n > 0) {
+                if (s->clen + (int)n > SES_IOBUF) s->clen = 0;
+                memcpy(s->cbuf + s->clen, buf, (size_t)n);
+                s->clen += (int)n;
+                session_handle_frames(s, &did_run);
+            } else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+                break;
+            }
+            if (s->quitting) break;
+        }
+
+        for (int k = 0; k < MAX_JOBS; k++) {
+            Job *j = &sh->jobs[k];
+            if (j->used && j->pipe_fd >= 0 && FD_ISSET(j->pipe_fd, &rfds))
+                drain_job(sh, j);
+        }
+        tab_reap_jobs(sh);
+
+        restart_due_watches(sh);
+        if (sh->watching) {
+            for (int w = 0; w < sh->nwatch; w++) {
+                WatchCmd *wc = &sh->watches[w];
+                if (wc->pipe_fd >= 0 && FD_ISSET(wc->pipe_fd, &rfds))
+                    drain_watch_cmd(sh, wc);
+            }
+        }
+
+        int busy = (foreground_job(sh) != NULL) || sh->watching;
+        if (did_run) last_busy = -1;     /* always refresh after a command */
+        if (busy != last_busy) {
+            last_busy = busy;
+            session_emit_int(s, F_BUSY, busy);
+        }
+    }
+
+    /* Tear down this tab's children before going away. */
+    for (int i = 0; i < MAX_JOBS; i++) {
+        Job *j = &sh->jobs[i];
+        if (!j->used) continue;
+        if (j->pgid > 0) { kill(-j->pgid, SIGCONT); kill(-j->pgid, SIGTERM); }
+        if (j->pipe_fd >= 0) close(j->pipe_fd);
+        j->used = 0;
+    }
+    if (sh->watching) {
+        for (int i = 0; i < sh->nwatch; i++) {
+            WatchCmd *w = &sh->watches[i];
+            if (w->pid > 0) { kill(-w->pid, SIGKILL); w->pid = 0; }
+            if (w->pipe_fd >= 0) { close(w->pipe_fd); w->pipe_fd = -1; }
+        }
+    }
+
+    if (s->user_exit) session_emit_int(s, F_QUIT, 0);   /* `exit` → close tab */
+}
+
+static void *session_thread_main(void *arg) {
+    session_run_loop((TabSession *)arg);
+    return NULL;
+}
+
+static TabSession *session_create(Tab *gui_tab, const char *cwd) {
+    TabSession *s = calloc(1, sizeof(TabSession));
+    if (!s) return NULL;
+
+    s->mode    = g_use_process ? EXEC_PROCESS : EXEC_THREAD;
+    s->gui_tab = gui_tab;
+    s->alive   = 1;
+    s->shell   = calloc(1, sizeof(Tab));
+    if (!s->shell) { free(s); return NULL; }
+    session_shell_reset(s->shell, cwd);
+
+    int ab[2], ba[2];
+    if (pipe(ab) < 0 || pipe(ba) < 0) {
+        perror("pipe");
+        free(s->shell); free(s);
+        return NULL;
+    }
+    s->to_sess   = ab[1];        /* GUI writes commands here     */
+    s->sfds[0]   = ab[0];        /* session reads them here      */
+    s->from_sess = ba[0];        /* GUI reads output here        */
+    s->sfds[1]   = ba[1];        /* session writes output here   */
+
+    /* the GUI side must never block on a session that is slow to answer */
+    int fl = fcntl(s->from_sess, F_GETFL, 0);
+    if (fl >= 0) fcntl(s->from_sess, F_SETFL, fl | O_NONBLOCK);
+
+    if (s->mode == EXEC_THREAD) {
+        if (pthread_create(&s->tid, NULL, session_thread_main, s) != 0) {
+            perror("pthread_create");
+            close(s->to_sess); close(s->from_sess);
+            close(s->sfds[0]); close(s->sfds[1]);
+            free(s->shell); free(s);
+            return NULL;
+        }
+    } else {
+        pid_t pid = fork();
+        if (pid < 0) {
+            perror("fork");
+            close(s->to_sess); close(s->from_sess);
+            close(s->sfds[0]); close(s->sfds[1]);
+            free(s->shell); free(s);
+            return NULL;
+        }
+        if (pid == 0) {
+            /* ---- the tab's own process: keep only its pipe ends ---- */
+            close(s->to_sess);
+            close(s->from_sess);
+            for (int i = 0; i < MAX_TABS; i++) {
+                TabSession *o = sessions[i];
+                if (!o || o == s) continue;
+                if (o->to_sess   >= 0) close(o->to_sess);
+                if (o->from_sess >= 0) close(o->from_sess);
+                if (o->sfds[0]   >= 0) close(o->sfds[0]);
+                if (o->sfds[1]   >= 0) close(o->sfds[1]);
+            }
+            signal(SIGINT,  SIG_DFL);        /* a tab is its own session */
+            signal(SIGTSTP, SIG_DFL);
+            session_run_loop(s);
+            _exit(0);
+        }
+        s->pid = pid;
+        close(s->sfds[0]); s->sfds[0] = -1;  /* parent keeps only its ends */
+        close(s->sfds[1]); s->sfds[1] = -1;
+    }
+    return s;
+}
+
+static void session_close(TabSession *s) {
+    if (!s) return;
+
+    if (!s->closing) {
+        s->closing = 1;
+        frame_write(s->to_sess, C_CLOSE, NULL, 0);
+        if (s->mode == EXEC_THREAD) {
+            /* the thread must not block on a full output pipe while we
+             * wait for it, so make its writing end non-blocking */
+            int fl = fcntl(s->sfds[1], F_GETFL, 0);
+            if (fl >= 0) fcntl(s->sfds[1], F_SETFL, fl | O_NONBLOCK);
+        }
+    }
+
+    if (s->mode == EXEC_THREAD) {
+        if (s->tid) { pthread_join(s->tid, NULL); s->tid = 0; }
+    } else if (s->pid > 0) {
+        int st, done = 0;
+        for (int i = 0; i < 100; i++) {          /* up to ~1s to exit politely */
+            pid_t r = waitpid(s->pid, &st, WNOHANG);
+            if (r == s->pid) { done = 1; break; }
+            if (r < 0 && errno != EINTR) { done = 1; break; }
+            usleep(10000);
+        }
+        if (!done) {                             /* rude but it is only a tab */
+            kill(s->pid, SIGKILL);
+            waitpid(s->pid, &st, 0);
+        }
+        s->pid = 0;
+    }
+
+    if (s->to_sess   >= 0) close(s->to_sess);
+    if (s->from_sess >= 0) close(s->from_sess);
+    if (s->sfds[0]   >= 0) close(s->sfds[0]);
+    if (s->sfds[1]   >= 0) close(s->sfds[1]);
+    free(s->shell);
+    free(s);
+}
+
+static void session_destroy_all(void) {
+    for (int i = 0; i < MAX_TABS; i++) {
+        if (sessions[i]) {
+            session_close(sessions[i]);
+            sessions[i] = NULL;
+        }
+    }
+}
+
+int main(int argc, char **argv) {
+    /* Execution mode comes from the command line:
+     *     ./terminator                  -> thread mode  (one pthread per tab)
+     *     ./terminator useProcess=True  -> process mode (one fork() per tab) */
+    for (int i = 1; i < argc; i++) {
+        if (strncmp(argv[i], "useProcess=", 11) == 0) {
+            const char *v = argv[i] + 11;
+            g_use_process = (strcasecmp(v, "true") == 0 || strcmp(v, "1") == 0);
+        }
+    }
+
+    /* A session may outlive the pipe the GUI reads from; without this a
+     * write to a closed pipe would kill the whole GUI in thread mode. */
+    signal(SIGPIPE, SIG_IGN);
+
+    /* One shared, locked history: process memory + mutex in thread mode,
+     * shm_open()+MAP_SHARED + process-shared semaphore in process mode. */
+    history_init();
+
     Display *display = XOpenDisplay(NULL);
     if (display == NULL) {
         printf("Unable to connect to X11\n");
@@ -2616,52 +3351,30 @@ int main(void) {
         FD_SET(x11_fd, &rfds);
         int max_fd = x11_fd;
 
-        // Monitor job output pipes and multiWatch pipes across all tabs
+        // Monitor the output pipe of every tab's session.  The jobs and
+        // multiWatch pipes live in the session, not here, so the GUI only
+        // watches the X11 socket plus one fd per tab.
         for (int i = 0; i < num_tabs; i++) {
-            for (int k = 0; k < MAX_JOBS; k++) {
-                int fd = tabs[i].jobs[k].pipe_fd;
-                if (tabs[i].jobs[k].used && fd >= 0) {
-                    FD_SET(fd, &rfds);
-                    if (fd > max_fd) max_fd = fd;
-                }
-            }
-            if (tabs[i].watching) {
-                for (int w = 0; w < tabs[i].nwatch; w++) {
-                    int fd = tabs[i].watches[w].pipe_fd;
-                    if (fd >= 0) {
-                        FD_SET(fd, &rfds);
-                        if (fd > max_fd) max_fd = fd;
-                    }
-                }
+            int fd = session_gui_fd(sessions[i]);
+            if (fd >= 0) {
+                FD_SET(fd, &rfds);
+                if (fd > max_fd) max_fd = fd;
             }
         }
 
-               struct timeval tv, *tvp = NULL;
-        int blink = 0;
+        /* No scheduled wake-up here: multiWatch timers belong to the
+         * sessions.  Poll every 500 ms just to blink the caret. */
+        struct timeval tv;
+        tv.tv_sec  = 0;
+        tv.tv_usec = 500000;
 
-        time_t deadline = next_watch_deadline();
-        if (deadline != 0) {
-            time_t now = time(NULL);
-            long wait_s = deadline - now;
-            if (wait_s < 0) wait_s = 0;
-            tv.tv_sec = wait_s;
-            tv.tv_usec = 0;
-            tvp = &tv;
-        } else {
-            /* no scheduled wake-up: poll every 500 ms for the caret blink */
-            tv.tv_sec  = 0;
-            tv.tv_usec = 500000;
-            tvp = &tv;
-            blink = 1;
-        }
-
-        int retval = select(max_fd + 1, &rfds, NULL, NULL, tvp);
+        int retval = select(max_fd + 1, &rfds, NULL, NULL, &tv);
         if (retval < 0) {
             if (errno == EINTR) continue;
             break;
         }
 
-        if (blink && retval == 0) {
+        if (retval == 0) {
             /* timeout with no I/O: flip the caret and repaint */
             cursor_visible = !cursor_visible;
             redraw(display, window, gc, scr);
@@ -2855,17 +3568,13 @@ int main(void) {
                     }
 
                     Bool ctrl = (state & ControlMask) != 0;
+                    TabSession *sess = sessions[current_tab];
 
-                    /* Ctrl+C: interrupt the foreground job.  The signal is
-                     * sent by us, so Terminator itself never stops. */
+                    /* Ctrl+C: interrupt this tab's foreground job.  The
+                     * session does the killing, so no other tab is touched. */
                     if (ctrl && (keysym == XK_c || keysym == XK_C)) {
-                        Job *j = foreground_job(t);
-                        if (j) {
-                            kill(-j->pgid, SIGINT);
-                            kill(-j->pgid, SIGCONT);
-                            append_output(t, "^C\n");
-                        } else if (t->watching) {
-                            stop_multiwatch(t, 1);
+                        if (session_busy(t)) {
+                            if (sess) session_send_signal(sess, SIGINT);
                         } else {
                             t->input_len = 0;
                             t->input_line[0] = '\0';
@@ -2877,17 +3586,10 @@ int main(void) {
                         continue;
                     }
 
-                    /* Ctrl+Z: suspend the foreground job and take back the
-                     * prompt; report it like a real shell. */
+                    /* Ctrl+Z: suspend this tab's foreground job. */
                     if (ctrl && (keysym == XK_z || keysym == XK_Z)) {
-                        Job *j = foreground_job(t);
-                        if (j) {
-                            int idx = t->fg_job;
-                            kill(-j->pgid, SIGTSTP);
-                            append_output(t, "^Z\n");
-                            /* Block briefly so the suspend is reported now;
-                             * job_reap prints "[n]+ Stopped <cmd>" itself. */
-                            job_reap(t, idx, 1);
+                        if (session_busy(t)) {
+                            if (sess) session_send_signal(sess, SIGTSTP);
                         } else {
                             t->input_len = 0;
                             t->input_line[0] = '\0';
@@ -2895,7 +3597,6 @@ int main(void) {
                             append_output(t, "^Z\n");
                         }
                         t->in_sel_active = 0;
-                        tab_reap_jobs(t);
                         redraw(display, window, gc, scr);
                         continue;
                     }
@@ -2903,7 +3604,7 @@ int main(void) {
                     /* Ctrl+R: start a reverse history search.  The prompt
                      * becomes "Enter search term: " until Enter/Escape. */
                     if (ctrl && (keysym == XK_r || keysym == XK_R)) {
-                        if (!t->search_mode && foreground_job(t) == NULL) {
+                        if (!t->search_mode && !session_busy(t)) {
                             t->search_mode = 1;
                             t->in_sel_active = 0;
                             t->input_len = 0;
@@ -2915,11 +3616,11 @@ int main(void) {
                         continue;
                     }
 
-                    /* While a foreground job owns the terminal, hide the
-                     * prompt and swallow every other keystroke: the shell
-                     * is "busy" until the job finishes or is suspended.
-                     * Only Ctrl+C / Ctrl+Z above reach the child. */
-                    if (foreground_job(t) != NULL)
+                    /* While a command owns this tab, hide the prompt and
+                     * swallow every other keystroke: the shell is "busy"
+                     * until the job finishes or is suspended.  Only Ctrl+C /
+                     * Ctrl+Z above reach the session. */
+                    if (session_busy(t))
                         continue;
 
                     if (ctrl && (keysym == XK_t || keysym == XK_T)) {
@@ -3009,7 +3710,13 @@ int main(void) {
                                     t->input_line[--t->input_len] = '\0';
                                 }
 
-                                execute_command(t);
+                                /* Hand the finished line to this tab's
+                                 * session; it runs it, echoes it and sends
+                                 * the output back.  The GUI stays idle. */
+                                if (sess && sess->alive) {
+                                    session_send_run(sess, t->input_line);
+                                    sess->busy = 1;   /* hide the prompt now */
+                                }
 
                                 t->multiline_len = 0;
                                 t->multiline_buf[0] = '\0';
@@ -3070,41 +3777,43 @@ int main(void) {
             }
         }
 
-        for (int i = 0; i < num_tabs; i++)
-            restart_due_watches(&tabs[i]);
-
-        // Collect job output and reap finished/stopped jobs
+        /* Pull whatever each tab's session produced and show it.  The
+         * session already ran the command, drained its pipes and reaped
+         * its jobs, so the GUI has nothing else to do here. */
         for (int i = 0; i < num_tabs; i++) {
-            Tab *t = &tabs[i];
-            if (t->watching) {
-                int changed = 0;
-                for (int w = 0; w < t->nwatch; w++) {
-                    WatchCmd *wc = &t->watches[w];
-                    if (wc->pipe_fd >= 0 && FD_ISSET(wc->pipe_fd, &rfds)) {
-                        if (drain_watch_cmd(t, wc))
-                            changed = 1;
-                    }
-                }
-                if (changed) redraw(display, window, gc, scr);
-            }
+            TabSession *s = sessions[i];
+            if (!s) continue;
 
-            int got_output = 0;
-            for (int k = 0; k < MAX_JOBS; k++) {
-                Job *j = &t->jobs[k];
-                if (!j->used || j->pipe_fd < 0) continue;
-                if (FD_ISSET(j->pipe_fd, &rfds) && drain_job(t, j))
-                    got_output = 1;
-            }
-
-            int before = job_count(t);
-            tab_reap_jobs(t);
-            int after = job_count(t);
-            if (got_output || after != before)
+            if (s->from_sess >= 0 && FD_ISSET(s->from_sess, &rfds)) {
+                session_gui_drain(s);
                 redraw(display, window, gc, scr);
+            }
+
+            if (s->dead && !s->notified && !s->closing) {
+                s->notified = 1;
+                if (s->gui_tab) {
+                    append_output(s->gui_tab, "\nterminator: session ended\n");
+                    redraw(display, window, gc, scr);
+                }
+            }
+        }
+
+        /* A session asked for its tab to go away (`exit` built-in). */
+        for (int i = 0; i < num_tabs; i++) {
+            if (sessions[i] && sessions[i]->gui_quit) {
+                if (num_tabs > 1) {
+                    close_tab(i);
+                    redraw(display, window, gc, scr);
+                } else {
+                    goto cleanup;
+                }
+                break;
+            }
         }
     }
 
 cleanup:
+    session_destroy_all();
     history_save_file();
     XDestroyWindow(display, window);
     XCloseDisplay(display);
