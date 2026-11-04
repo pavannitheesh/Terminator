@@ -173,7 +173,7 @@ A suggested layout:
 
 ```text
 .
-├── terminator.c
+├── src/terminator.c
 ├── Makefile
 ├── README.md
 └── DESIGN.md

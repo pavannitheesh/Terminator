@@ -374,10 +374,6 @@ The implementation uses fixed-size arrays and buffers. Important limits include:
 
 Other limitations to document honestly:
 
-- This is not a complete Bash or POSIX shell implementation.
-- `source` currently executes ordinary lines sequentially; it does not implement the full conditional/script grammar in the project specification.
-- General variable expansion, positional script arguments and command substitution are not implemented by the shown command parser.
-- The multiline check handles quote/backslash continuation only; it is not a complete parser for nested substitutions or shell syntax.
 - The command parser supports a limited set of quoting and redirection forms.
 - X11 is required; the application is not a native Wayland terminal.
 
